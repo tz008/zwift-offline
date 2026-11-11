@@ -1,45 +1,44 @@
-# -*- mode: python -*-
+# -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
 
-block_cipher = None
+root = Path(SPECPATH).resolve()
+datas = []
+for entry in (root / 'scripts' / 'windows_resources.txt').read_text(encoding='utf-8-sig').splitlines():
+    entry = entry.strip()
+    if not entry or entry.startswith('#'):
+        continue
+    relative = Path(entry)
+    source = root / relative
+    if relative.is_absolute() or '..' in relative.parts or not source.is_file():
+        raise ValueError('Invalid or missing Windows bundle resource: %s' % entry)
+    if relative.parts[0] not in ('cdn', 'data', 'ssl', 'LICENSE'):
+        raise ValueError('Resource is outside the public bundle allowlist: %s' % entry)
+    datas.append((str(source), str(relative.parent)))
+licenses = root / 'build' / 'third-party-licenses'
+if not (licenses / 'NOTICE.txt').is_file():
+    raise ValueError('Dependency notices are missing; use build.cmd to build.')
+datas.append((str(licenses), 'third-party-licenses'))
 
-import sys
-sys.modules['FixTk'] = None
-import xml.etree.ElementTree as ET
-version = ET.parse('cdn/gameassets/Zwift_Updates_Root/Zwift_ver_cur.xml').getroot().get('version')
-
-a = Analysis(['standalone.py'],
-             pathex=['protobuf'],
-             binaries=[],
-             datas=[('ssl/*', 'ssl'), ('data/*', 'data')],
-             hiddenimports=[],
-             hookspath=[],
-             runtime_hooks=[],
-             excludes=['FixTk', 'tcl', 'tk', '_tkinter', 'tkinter', 'Tkinter', 'pkg_resources'],
-             win_no_prefer_redirects=False,
-             win_private_assemblies=False,
-             cipher=block_cipher,
-             noarchive=False)
-a.binaries = [x for x in a.binaries if not 'Java_Temurin' in x[1]]
-a.datas += Tree('cdn', prefix='cdn')
-pyz = PYZ(a.pure, a.zipped_data,
-             cipher=block_cipher)
-exe = EXE(pyz,
-          a.scripts,
-          a.binaries,
-          a.zipfiles,
-          a.datas,
-          [],
-          name='zoffline_' + version,
-          debug=False,
-          bootloader_ignore_signals=False,
-          strip=False,
-          upx=True,
-          upx_exclude=['greenlet\\*.pyd', '_uuid.pyd', 'python3.dll'],
-          runtime_tmpdir=None,
-          console=True )
-
-import subprocess
-subprocess.call(['C:\\Program Files (x86)\\Windows Kits\\10\\App Certification Kit\\signtool.exe', 'sign',
-                '/f', 'ssl\\cert-zwift-com.p12', '/fd', 'sha1',
-                '/t', 'http://timestamp.digicert.com',
-                'dist\\zoffline_%s.exe' % version])
+a = Analysis(
+    [str(root / 'windows_launcher.py')],
+    pathex=[str(root), str(root / 'protobuf')],
+    binaries=[],
+    datas=datas,
+    hiddenimports=['standalone'],
+    hookspath=[],
+    runtime_hooks=[],
+    excludes=['tkinter', '_tkinter'],
+    noarchive=False,
+)
+pyz = PYZ(a.pure)
+exe = EXE(
+    pyz, a.scripts, a.binaries, a.datas, [],
+    name='zoffline',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    runtime_tmpdir=None,
+    console=True,
+    uac_admin=False,
+)

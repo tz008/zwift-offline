@@ -879,4 +879,5 @@ if os.path.exists(FAKE_DNS_FILE):
     dns = threading.Thread(target=fake_dns, args=(zo.server_ip,))
     dns.start()
 
-zo.run_standalone(online, global_relay, global_pace_partners, global_bots, global_ghosts, regroup_ghosts, discord)
+zo.run_standalone(online, global_relay, global_pace_partners, global_bots, global_ghosts, regroup_ghosts, discord,
+                  on_ready=globals().get('on_server_ready'))

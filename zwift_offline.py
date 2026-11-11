@@ -41,7 +41,7 @@ from collections import deque
 from itertools import islice
 from stravalib.client import Client
 
-sys.path.append(os.path.join(sys.path[0], 'protobuf')) # otherwise import in .proto does not work
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'protobuf')) # otherwise import in .proto does not work
 import udp_node_msgs_pb2
 import tcp_node_msgs_pb2
 import activity_pb2
@@ -5053,7 +5053,7 @@ class CleanWSGIServer(WSGIServer):
             logger.warning('WSGIServer: connection reset by client (missing certificate in cacert.pem?)')
 
 
-def run_standalone(passed_online, passed_global_relay, passed_global_pace_partners, passed_global_bots, passed_global_ghosts, passed_regroup_ghosts, passed_discord):
+def run_standalone(passed_online, passed_global_relay, passed_global_pace_partners, passed_global_bots, passed_global_ghosts, passed_regroup_ghosts, passed_discord, on_ready=None):
     global online
     global global_relay
     global global_pace_partners
@@ -5100,7 +5100,6 @@ def run_standalone(passed_online, passed_global_relay, passed_global_pace_partne
     send_message_thread.start()
     remove_inactive_thread = threading.Thread(target=remove_inactive)
     remove_inactive_thread.start()
-    logger.info("Server version %s is running." % ZWIFT_VER_CUR)
     SERVER_HOST = os.environ.get('ZOFFLINE_SERVER_HOST', '0.0.0.0')
     host = os.environ.get('ZOFFLINE_API_HOST', SERVER_HOST)
     port = int(os.environ.get('ZOFFLINE_API_PORT', 443))
@@ -5111,6 +5110,10 @@ def run_standalone(passed_online, passed_global_relay, passed_global_pace_partne
     if use_cert:
         context.load_cert_chain(certfile='%s/cert-zwift-com.pem' % SSL_DIR, keyfile='%s/key-zwift-com.pem' % SSL_DIR)
     server = CleanWSGIServer((host, port), app, log=logger, ssl_context=context)
+    server.start()
+    logger.info("Server version %s is running." % ZWIFT_VER_CUR)
+    if on_ready is not None:
+        on_ready()
     server.serve_forever()
 
 #    app.run(ssl_context=('%s/cert-zwift-com.pem' % SSL_DIR, '%s/key-zwift-com.pem' % SSL_DIR), port=443, threaded=True, host=SERVER_HOST) # debug=True, use_reload=False)

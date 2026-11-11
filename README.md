@@ -6,6 +6,24 @@ zoffline also offers riding against ghosts (your previous rides). Enable this fe
 
 Additionally, zoffline's launcher allows selecting a specific map to ride on without mucking about with config files.
 
+## Windows single-file build
+
+On **x64 Windows with x64 CPython 3.11 or 3.12** installed, run this command from the repository:
+
+```powershell
+.\build.cmd
+```
+
+The command creates an isolated `.venv-build`, installs the pinned dependencies from `requirements-windows-build.txt` and `requirements-windows-lock.txt`, collects dependency license notices, and runs PyInstaller. Internet access is needed to install build dependencies. No Windows SDK, signing certificate, UPX, or administrator privileges are required. A failed step returns a nonzero exit code with the underlying error. The output is **`dist\zoffline.exe`**. The command also works when called using an absolute path from another working directory. Run `python -m unittest discover -s tests -v` to check discovery and startup behavior without starting Zwift.
+
+Copy **only `zoffline.exe`** to a writable folder on the user's x64 Windows PC; Python and the source tree are not needed there. The EXE includes the Python runtime, application libraries (including the optional Garmin/Discord integrations), project web assets, default data, TLS files, and license notices. It unpacks its internal files into a temporary directory at runtime. Zwift itself is not bundled. `storage` and, when enabled, `logs` are created beside the EXE; retain these directories during upgrades. Local accounts, activity data, cached install paths, and credentials from the build machine are excluded through an explicit resource allowlist in `scripts/windows_resources.txt`. Update that list when adding public runtime resources.
+
+Install/update Zwift, then double-click the EXE. Windows asks for **UAC administrator permission** for a hidden configuration helper that temporarily adjusts the hosts file, the Windows machine Root certificate store and Zwift's `data\cacert.pem`. The visible server and Zwift Launcher continue under the original user's account, including when another administrator approves UAC. The helper preserves existing configuration and restores only its own changes when the EXE exits. A detached recovery process watches the helper and restores configuration if it is terminated; a journal under `%ProgramData%\zoffline\client-config` is retried on the next elevated start if recovery was interrupted. The EXE finds the local installation, starts the server, and opens **Zwift Launcher after all server sockets have bound**. Choose the map and click `Start Zwift` as before. Keep the console open while riding; save and exit the game before closing the server console or pressing Ctrl+C. Closing zoffline while Zwift is still open can interrupt the game connection.
+
+Discovery checks the legacy `scripts\zwift_location.txt` cache beside the application, HKCU/HKLM App Paths and uninstall records in both registry views, common Program Files/LocalAppData locations, then explicit `Zwift`/`Games\Zwift`/Program Files candidates on fixed local drives. It selects the first valid directory in that order (HKCU before HKLM, 64-bit view before 32-bit, fixed drives alphabetically). A valid installation must contain `ZwiftLauncher.exe`, `ZwiftApp.exe`, and `data\cacert.pem`. The search does not recurse through drives, query network locations, or ask for a path. Missing Zwift produces a persistent native dialog reading **“请先安装Zwift”** and exits before starting the server. Access errors and startup failures have distinct visible diagnostics.
+
+If a configuration cannot be restored, the program shows an error and retains the original bytes in the protected recovery journal for manual inspection; an interrupted restore is retried on the next elevated start. UAC denial or port conflicts stop startup with a visible error before client configuration changes. This EXE is for a PC running both zoffline and Zwift. The manual **[Step 2 configuration](#step-2-configure-zwift-client-to-use-zoffline)** below still applies to source installs, older releases and remote clients, but is not required for this EXE. Packaging and local smoke tests do not replace testing on a clean Windows PC without Python or a complete ride; see [运行.md](运行.md) for the current validation record and Chinese instructions.
+
 ## Install
 
 Setting up zoffline requires two primary steps. First, zoffline must be installed and run on a system before running Zwift (either on the system running Zwift or on another locally networked system).  Second, Zwift must be configured to use zoffline instead of the official Zwift server.
@@ -18,10 +36,9 @@ To install zoffline on Windows:
 
 * Download the latest zoffline release from https://github.com/fatsbrown/zwift-offline/releases/latest
 * If you are not running zoffline on the same PC that Zwift is running: create a ``server-ip.txt`` file in the ``storage`` directory containing the IP address of the PC running zoffline.
-* Run the downloaded zoffline.exe
+* For the single-file EXE built from this repository, install Zwift, then run `zoffline.exe` and accept the UAC prompt. It configures and later restores the client hosts/certificates automatically.
   * Once run, zoffline will create a ``storage`` directory in the same folder it's in to store your Zwift progress.
-* Start Zwift with zoffline.exe running (__after completing step 2__ or running __configure_client__ script from https://github.com/oldnapalm/zoffline-helper/releases/latest)
-  * It takes zoffline a few seconds to start. Wait until text appears in the command prompt before opening Zwift.
+  * It discovers the local installation and opens Zwift Launcher once the server is ready. For older upstream release EXEs, start Zwift manually with zoffline running (__after completing step 2__ or running __configure_client__ script from https://github.com/oldnapalm/zoffline-helper/releases/latest).
 * When done with Zwift, press Ctrl+C in the command line to close zoffline.
 </details>
 
@@ -90,6 +107,8 @@ zoffline can be installed on the same machine as Zwift or another local machine.
 </details>
 
 ### Step 2: Configure Zwift client to use zoffline
+
+The single-file `zoffline.exe` built by this repository performs temporary client configuration automatically and restores its changes after exit. The instructions in this section are for source installs, older EXEs or remote clients. Do not run the permanent configuration script for the new EXE unless you want those settings to remain after it closes.
 
 <details><summary>Windows Instructions</summary>
 

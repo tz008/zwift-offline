@@ -1,5 +1,6 @@
 # Python virtual environments and installed packages
 .venv/
+.venv-build/
 venv/
 env/
 ENV/
