@@ -1,6 +1,7 @@
 """Regression tests for temporary hosts/certificate changes and recovery."""
 
 import ctypes
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -37,6 +38,8 @@ class TemporaryConfigurationTests(unittest.TestCase):
         self.add = patch.object(config, 'add_certificate').start()
         self.remove = patch.object(config, 'remove_certificate').start()
         self.flush_dns = patch.object(config, '_flush_dns').start()
+        self.firewall_add = patch.object(config.windows_network, 'add_firewall_rules').start()
+        self.firewall_remove = patch.object(config.windows_network, 'remove_firewall_rules').start()
         self.addCleanup(patch.stopall)
 
     def apply(self):
@@ -53,6 +56,83 @@ class TemporaryConfigurationTests(unittest.TestCase):
         self.assertEqual(self.cacert.read_bytes(), self.original_cacert)
         self.remove.assert_called_once_with(DER, session.stem.removeprefix('session-'))
         self.assertFalse(session.exists())
+
+    def test_remote_hosts_override_restores_existing_local_configuration(self):
+        original = b'127.0.0.1 ' + b' '.join(config.DOMAINS) + b'\r\n'
+        self.hosts.write_bytes(original)
+        session = config.apply_configuration(self.cacert.parent.parent, self.journals,
+                                             server_ip='192.168.1.100')
+        self.assertIn(b'192.168.1.100 ' + b' '.join(config.DOMAINS), self.hosts.read_bytes())
+        config.restore_configuration(session)
+        self.assertEqual(self.hosts.read_bytes(), original)
+        self.firewall_add.assert_not_called()
+        self.firewall_remove.assert_not_called()
+
+    def test_server_only_journals_firewall_before_add_without_touching_client(self):
+        def add(session_id, server_ip):
+            journal_path = self.journals / ('session-' + session_id + '.json')
+            journal = json.loads(journal_path.read_text(encoding='utf-8'))
+            self.assertTrue(journal['firewall_add_attempted'])
+            self.assertEqual(journal['files'], {})
+            self.assertEqual(server_ip, '192.168.1.100')
+        self.firewall_add.side_effect = add
+        session = config.apply_configuration(None, self.journals, server_ip='192.168.1.100', allow_lan=True)
+        self.mock_paths.assert_not_called()
+        self.mock_cert.assert_not_called()
+        self.installed.assert_not_called()
+        self.add.assert_not_called()
+        config.restore_configuration(session)
+        self.firewall_remove.assert_called_once_with(session.stem.removeprefix('session-'))
+        self.remove.assert_not_called()
+        self.assertEqual(self.hosts.read_bytes(), self.original_hosts)
+        self.assertFalse(session.exists())
+
+    def test_partial_firewall_failure_rolls_back_client_and_attempted_rules(self):
+        self.firewall_add.side_effect = RuntimeError('UDP rule failed')
+        with self.assertRaisesRegex(RuntimeError, 'UDP rule failed'):
+            config.apply_configuration(self.cacert.parent.parent, self.journals,
+                                       server_ip='192.168.1.100', allow_lan=True)
+        self.firewall_remove.assert_called_once()
+        self.assertEqual(self.hosts.read_bytes(), self.original_hosts)
+        self.assertEqual(self.cacert.read_bytes(), self.original_cacert)
+        self.assertFalse(list(self.journals.glob('session-*.json')))
+
+    def test_firewall_restore_failure_preserves_journal_and_retries(self):
+        session = config.apply_configuration(None, self.journals,
+                                             server_ip='192.168.1.100', allow_lan=True)
+        self.firewall_remove.side_effect = PermissionError('firewall denied')
+        with self.assertRaisesRegex(config.ClientConfigurationError, 'Windows Firewall'):
+            config.restore_configuration(session)
+        self.assertTrue(session.exists())
+        self.firewall_remove.side_effect = None
+        config.restore_stale_sessions(self.journals)
+        self.assertFalse(session.exists())
+
+    def test_client_restore_conflict_still_removes_firewall_and_keeps_record(self):
+        session = config.apply_configuration(self.cacert.parent.parent, self.journals,
+                                             server_ip='192.168.1.100', allow_lan=True)
+        changed = self.hosts.read_bytes().replace(b'192.168.1.100 ', b'192.168.1.101 ')
+        self.hosts.write_bytes(changed)
+        with self.assertRaises(config.ClientConfigurationError):
+            config.restore_configuration(session)
+        self.firewall_remove.assert_called_once()
+        self.assertEqual(self.hosts.read_bytes(), changed)
+        self.assertTrue(session.exists())
+
+    def test_previous_version_journal_without_firewall_field_restores(self):
+        session = self.apply()
+        journal = json.loads(session.read_text(encoding='utf-8'))
+        del journal['firewall_add_attempted']
+        session.write_text(json.dumps(journal), encoding='utf-8')
+        config.restore_configuration(session)
+        self.firewall_remove.assert_not_called()
+        self.assertEqual(self.hosts.read_bytes(), self.original_hosts)
+
+    def test_invalid_lan_address_makes_no_changes(self):
+        with self.assertRaises(ValueError):
+            config.apply_configuration(None, self.journals, allow_lan=True)
+        self.firewall_add.assert_not_called()
+        self.assertFalse(list(self.journals.glob('session-*.json')))
 
     def test_existing_hosts_and_certificates_survive_unchanged(self):
         hosts = b'127.0.0.1 ' + b' '.join(config.DOMAINS) + b'\r\n'
@@ -262,7 +342,7 @@ class LauncherFailureTests(unittest.TestCase):
         self.assertEqual(calls, ['restore', 'release'])
 
     def test_broken_stderr_still_shows_dialog(self):
-        with patch.object(windows_launcher, 'find_zwift_installation', side_effect=RuntimeError('failure')), \
+        with patch('windows_gui.run_gui', side_effect=RuntimeError('failure')), \
                 patch.object(windows_launcher.traceback, 'print_exc', side_effect=BrokenPipeError), \
                 patch.object(windows_launcher, 'show_error') as dialog:
             self.assertEqual(windows_launcher.main([]), 1)

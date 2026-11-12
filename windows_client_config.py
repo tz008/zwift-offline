@@ -18,6 +18,8 @@ import subprocess
 import sys
 import uuid
 
+import windows_network
+
 
 DOMAINS = (b'us-or-rly101.zwift.com', b'secure.zwift.com',
            b'cdn.zwift.com', b'launcher.zwift.com')
@@ -59,7 +61,8 @@ def configuration_directory():
     icacls = _windows_directory() / 'System32' / 'icacls.exe'
     result = subprocess.run([str(icacls), str(root), '/inheritance:r',
                              '/grant:r', '*S-1-5-32-544:(OI)(CI)F',
-                             '*S-1-5-18:(OI)(CI)F'], capture_output=True)
+                             '*S-1-5-18:(OI)(CI)F'], capture_output=True,
+                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     if result.returncode:
         raise ClientConfigurationError('无法保护临时配置备份目录：%s' % root)
     return root
@@ -228,7 +231,8 @@ def _active_host_domains(line):
     return set(content[1:]) & set(DOMAINS) if len(content) > 1 else set()
 
 
-def _hosts_change(original, session_id):
+def _hosts_change(original, session_id, server_ip='127.0.0.1'):
+    address = windows_network.validate_server_ip(server_ip, allow_loopback=True).encode('ascii')
     if b'\x00' in original:
         raise ClientConfigurationError('hosts 使用了不支持的编码，未修改文件。')
     bom = b'\xef\xbb\xbf' if original.startswith(b'\xef\xbb\xbf') else b''
@@ -236,10 +240,10 @@ def _hosts_change(original, session_id):
     good = set()
     for line in lines:
         columns = line.split(b'#', 1)[0].strip().lower().split()
-        if len(columns) > 1 and columns[0] == b'127.0.0.1':
+        if len(columns) > 1 and columns[0] == address:
             good.update(set(columns[1:]) & set(DOMAINS))
     conflicting = any(_active_host_domains(line) and
-                      line.split(b'#', 1)[0].strip().lower().split()[0] != b'127.0.0.1'
+                      line.split(b'#', 1)[0].strip().lower().split()[0] != address
                       for line in lines)
     if good == set(DOMAINS) and not conflicting:
         return original
@@ -263,7 +267,7 @@ def _hosts_change(original, session_id):
     modified = bom + b''.join(result)
     if modified and not modified.endswith((b'\r', b'\n')):
         modified += newline
-    modified += b'127.0.0.1 ' + b' '.join(DOMAINS)
+    modified += address + b' ' + b' '.join(DOMAINS)
     modified += b' # zoffline-temporary-' + session_id.encode('ascii') + newline
     return modified
 
@@ -302,7 +306,8 @@ def _write(path, data):
 
 def _flush_dns():
     executable = _windows_directory() / 'System32' / 'ipconfig.exe'
-    result = subprocess.run([str(executable), '/flushdns'], capture_output=True)
+    result = subprocess.run([str(executable), '/flushdns'], capture_output=True,
+                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     if result.returncode:
         raise ClientConfigurationError('hosts 已修改，但 Windows DNS 缓存刷新失败。')
 
@@ -312,21 +317,22 @@ def _paths(installation):
             'cacert': Path(installation) / 'data' / 'cacert.pem'}
 
 
-def apply_configuration(installation, journal_directory):
+def apply_configuration(installation, journal_directory, server_ip='127.0.0.1', allow_lan=False):
     """Journal before the first write; return the recoverable session file."""
+    server_ip = windows_network.validate_server_ip(server_ip, allow_loopback=not allow_lan)
     session_id = uuid.uuid4().hex
     path = Path(journal_directory) / ('session-' + session_id + '.json')
-    paths = _paths(installation)
-    certificate, der = _cert_der()
+    paths = _paths(installation) if installation is not None else {}
+    certificate, der = _cert_der() if paths else (b'', b'')
     before = {name: target.read_bytes() for name, target in paths.items()}
-    after = {'hosts': _hosts_change(before['hosts'], session_id),
-             'cacert': _cacert_change(before['cacert'], certificate, der, session_id)}
-    was_installed = certificate_is_installed(der)
+    after = ({'hosts': _hosts_change(before['hosts'], session_id, server_ip),
+              'cacert': _cacert_change(before['cacert'], certificate, der, session_id)} if paths else {})
+    was_installed = certificate_is_installed(der) if paths else True
     journal = {'version': 1, 'session_id': session_id,
                'files': {name: {'path': str(paths[name]), 'before': _encode(before[name]),
                                 'after': _encode(after[name])} for name in paths},
                'certificate_der': _encode(der), 'certificate_was_installed': was_installed,
-               'certificate_add_attempted': False}
+               'certificate_add_attempted': False, 'firewall_add_attempted': False}
     _save(path, journal)
     try:
         for name, target in paths.items():
@@ -346,6 +352,10 @@ def apply_configuration(installation, journal_directory):
                 journal['certificate_add_attempted'] = False
                 _save(path, journal)
                 raise
+        if allow_lan:
+            journal['firewall_add_attempted'] = True
+            _save(path, journal)
+            windows_network.add_firewall_rules(session_id, server_ip)
         return path
     except BaseException:
         restore_configuration(path)
@@ -422,8 +432,10 @@ def restore_configuration(journal_path):
     if journal.get('version') != 1 or journal_path.name != 'session-' + journal['session_id'] + '.json':
         raise ClientConfigurationError('临时配置恢复记录格式无效。')
     errors = []
-    for name in ('hosts', 'cacert'):
+    for name in journal['files']:
         try:
+            if name not in ('hosts', 'cacert'):
+                raise ClientConfigurationError('恢复记录包含未知的文件类型。')
             entry = journal['files'][name]
             target = Path(entry['path'])
             before, after = _decode(entry['before']), _decode(entry['after'])
@@ -443,6 +455,11 @@ def restore_configuration(journal_path):
             remove_certificate(_decode(journal['certificate_der']), journal['session_id'])
         except Exception as exc:
             errors.append('Windows Root: %s' % exc)
+    if journal.get('firewall_add_attempted', False):
+        try:
+            windows_network.remove_firewall_rules(journal['session_id'])
+        except Exception as exc:
+            errors.append('Windows Firewall: %s' % exc)
     if errors:
         raise ClientConfigurationError('临时配置未完全还原；恢复记录已保留：\n' + '\n'.join(errors))
     journal_path.unlink()

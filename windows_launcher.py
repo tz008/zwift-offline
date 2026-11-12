@@ -46,14 +46,15 @@ def start_server(installation):
     })
 
 
-def preflight_ports():
+def preflight_ports(environ=None):
     """Check the same bind addresses and ports used by the original server."""
-    host = os.environ.get('ZOFFLINE_SERVER_HOST', '')
+    environ = os.environ if environ is None else environ
+    host = environ.get('ZOFFLINE_SERVER_HOST', '')
     endpoints = (
-        (os.environ.get('ZOFFLINE_CDN_HOST', host), int(os.environ.get('ZOFFLINE_CDN_PORT', 80)), socket.SOCK_STREAM),
-        (os.environ.get('ZOFFLINE_TCP_HOST', host), int(os.environ.get('ZOFFLINE_TCP_PORT', 3025)), socket.SOCK_STREAM),
-        (os.environ.get('ZOFFLINE_UDP_HOST', host), int(os.environ.get('ZOFFLINE_UDP_PORT', 3024)), socket.SOCK_DGRAM),
-        (os.environ.get('ZOFFLINE_API_HOST', host or '0.0.0.0'), int(os.environ.get('ZOFFLINE_API_PORT', 443)), socket.SOCK_STREAM),
+        (environ.get('ZOFFLINE_CDN_HOST', host), int(environ.get('ZOFFLINE_CDN_PORT', 80)), socket.SOCK_STREAM),
+        (environ.get('ZOFFLINE_TCP_HOST', host), int(environ.get('ZOFFLINE_TCP_PORT', 3025)), socket.SOCK_STREAM),
+        (environ.get('ZOFFLINE_UDP_HOST', host), int(environ.get('ZOFFLINE_UDP_PORT', 3024)), socket.SOCK_DGRAM),
+        (environ.get('ZOFFLINE_API_HOST', host or '0.0.0.0'), int(environ.get('ZOFFLINE_API_PORT', 443)), socket.SOCK_STREAM),
     )
     for address, port, kind in endpoints:
         family = socket.AF_INET6 if ':' in address else socket.AF_INET
@@ -64,14 +65,16 @@ def preflight_ports():
             raise RuntimeError('服务端口 %s 无法使用：%s' % (port, exc)) from exc
 
 
-def run_elevated_copy(installation, port, token):
+def run_elevated_copy(installation, port, token, options=None):
     """Elevate only the temporary client-configuration helper."""
     shell = ctypes.windll.shell32
     shell.ShellExecuteW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
                                     ctypes.c_wchar_p, ctypes.c_wchar_p,
                                     ctypes.c_wchar_p, ctypes.c_int]
     shell.ShellExecuteW.restype = ctypes.c_void_p
-    arguments = ['--config-helper', str(port), token, str(installation)]
+    arguments = ['--config-helper', str(port), token, str(installation) if installation else '']
+    if options is not None:
+        arguments.append(json.dumps(options, ensure_ascii=True))
     if not getattr(sys, 'frozen', False):
         arguments.insert(0, str(Path(__file__).resolve()))
     result = shell.ShellExecuteW(None, 'runas', str(Path(sys.executable).resolve()),
@@ -98,12 +101,15 @@ def _read_message(channel):
     return message
 
 
-def _start_elevated_configuration(installation):
+def _start_elevated_configuration(installation, options=None):
     token = secrets.token_hex(32)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(('127.0.0.1', 0))
         listener.listen(1)
-        run_elevated_copy(installation, listener.getsockname()[1], token)
+        if options is None:
+            run_elevated_copy(installation, listener.getsockname()[1], token)
+        else:
+            run_elevated_copy(installation, listener.getsockname()[1], token, options)
         deadline = time.monotonic() + 120  # Includes time spent in the UAC prompt.
         while True:
             remaining = deadline - time.monotonic()
@@ -114,7 +120,7 @@ def _start_elevated_configuration(installation):
                 connection, _ = listener.accept()
             except socket.timeout as exc:
                 raise RuntimeError('等待临时 hosts/证书配置超时。') from exc
-            connection.settimeout(30)
+            connection.settimeout(90)  # Certificate/firewall setup and recovery watcher.
             channel = connection.makefile('rwb')
             accepted = False
             try:
@@ -132,7 +138,7 @@ def _start_elevated_configuration(installation):
                     connection.close()
 
 
-def _run_configuration_helper(port, token, installation):
+def _run_configuration_helper(port, token, installation, options=None):
     """Hold the elevated configuration until the user process stops."""
     with socket.create_connection(('127.0.0.1', int(port)), timeout=30) as connection:
         connection.settimeout(None)
@@ -142,10 +148,16 @@ def _run_configuration_helper(port, token, installation):
             try:
                 if not _is_elevated():
                     raise RuntimeError('配置辅助进程未获得管理员权限。')
-                validated = validate_zwift_installation(installation)
-                if validated is None:
+                if options is not None:
+                    from windows_session import validate_options
+                    options = validate_options(options)
+                needs_client = options is None or options['ride']
+                validated = validate_zwift_installation(installation) if needs_client else None
+                if needs_client and validated is None:
                     raise RuntimeError('Zwift 安装目录在提权后不再有效：%s' % installation)
-                with temporary_configuration(validated):
+                configuration = (temporary_configuration(validated) if options is None else
+                                 temporary_configuration(validated, options))
+                with configuration:
                     _send_message(channel, 'ready')
                     try:
                         _read_message(channel)  # STOP or EOF, including forced parent exit.
@@ -183,14 +195,19 @@ def _start_recovery_watcher(session):
 
 
 @contextmanager
-def temporary_configuration(installation):
+def temporary_configuration(installation, options=None):
     mutex = client_config.acquire_configuration_mutex()
     session = None
     try:
         journal_directory = client_config.configuration_directory()
         client_config.restore_stale_sessions(journal_directory)
-        preflight_ports()
-        session = client_config.apply_configuration(installation, journal_directory)
+        if options is None:
+            preflight_ports()
+            session = client_config.apply_configuration(installation, journal_directory)
+        else:
+            session = client_config.apply_configuration(
+                installation, journal_directory, server_ip=options['server_ip'],
+                allow_lan=options['mode'] == 'host')
         _start_recovery_watcher(session)
         print('临时 hosts/证书已配置；退出时将自动恢复。', flush=True)
         yield
@@ -226,6 +243,20 @@ def _run_with_elevated_configuration(installation):
             connection.close()
 
 
+def run_local():
+    """Original local startup, retained for source integrations and regressions."""
+    installation = find_zwift_installation(runtime_directory())
+    if installation is None:
+        show_error('请先安装Zwift')
+        return 1
+    print('找到 Zwift：%s\n正在启动 zoffline 服务……' % installation, flush=True)
+    if _is_elevated():
+        _run_configured(installation)
+    else:
+        _run_with_elevated_configuration(installation)
+    return 0
+
+
 def main(arguments=None):
     arguments = sys.argv[1:] if arguments is None else arguments
     try:
@@ -238,17 +269,19 @@ def main(arguments=None):
                 return 0
             if len(arguments) == 4 and arguments[0] == '--config-helper':
                 return _run_configuration_helper(arguments[1], arguments[2], arguments[3])
+            if len(arguments) == 5 and arguments[0] == '--config-helper':
+                return _run_configuration_helper(arguments[1], arguments[2], arguments[3],
+                                                 json.loads(arguments[4]))
+            if len(arguments) == 3 and arguments[0] == '--server-worker':
+                logs = runtime_directory() / 'logs'
+                logs.mkdir(parents=True, exist_ok=True)
+                sys.stdout = sys.stderr = (logs / 'desktop-server.log').open(
+                    'a', encoding='utf-8', buffering=1)
+                from windows_session import run_server_worker
+                return run_server_worker(int(arguments[1]), arguments[2])
             raise RuntimeError('未知启动参数。')
-        installation = find_zwift_installation(runtime_directory())
-        if installation is None:
-            show_error('请先安装Zwift')
-            return 1
-        print('找到 Zwift：%s\n正在启动 zoffline 服务……' % installation, flush=True)
-        if _is_elevated():
-            _run_configured(installation)
-        else:
-            _run_with_elevated_configuration(installation)
-        return 0
+        from windows_gui import run_gui
+        return run_gui()
     except KeyboardInterrupt:
         return 0
     except SystemExit as exc:
@@ -261,16 +294,23 @@ def main(arguments=None):
             traceback.print_exc()
         except Exception:
             pass
-        show_error('zoffline 启动失败：\n%s' % exc)
+        if arguments and arguments[0] == '--server-worker':
+            print('zoffline 服务启动失败：%s' % exc, file=sys.stderr, flush=True)
+        else:
+            show_error('zoffline 启动失败：\n%s' % exc)
         return 1
 
 
 if __name__ == '__main__':
     result = 1
     try:
-        for stream in (sys.stdout, sys.stderr):
-            if hasattr(stream, 'reconfigure'):
-                stream.reconfigure(errors='backslashreplace')
+        for name in ('stdout', 'stderr'):
+            stream = getattr(sys, name)
+            if stream is None:
+                stream = open(os.devnull, 'w', encoding='utf-8')
+                setattr(sys, name, stream)
+            elif hasattr(stream, 'reconfigure'):
+                stream.reconfigure(encoding='utf-8', errors='backslashreplace')
         result = main()
     finally:
         # Failed startup can leave non-daemon server threads behind. Always

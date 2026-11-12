@@ -112,6 +112,7 @@ if os.path.exists(SERVER_IP_FILE):
         server_ip = f.read().rstrip('\r\n')
 else:
     server_ip = '127.0.0.1'
+server_ip = os.environ.get('ZOFFLINE_SERVER_IP', server_ip)
 SECRET_KEY_FILE = "%s/secret-key.txt" % STORAGE_DIR
 ENABLEGHOSTS_FILE = "%s/enable_ghosts.txt" % STORAGE_DIR
 GHOST_PROFILE = None
@@ -121,6 +122,8 @@ if os.path.exists(GHOST_PROFILE_FILE):
         GHOST_PROFILE = json.load(f)
 ALL_TIME_LEADERBOARDS = os.path.exists("%s/all_time_leaderboards.txt" % STORAGE_DIR)
 MULTIPLAYER = os.path.exists("%s/multiplayer.txt" % STORAGE_DIR)
+if 'ZOFFLINE_MULTIPLAYER' in os.environ:
+    MULTIPLAYER = os.environ['ZOFFLINE_MULTIPLAYER'].lower() == 'true'
 if MULTIPLAYER:
     if not make_dir(LOGS_DIR):
         sys.exit(1)
@@ -599,6 +602,12 @@ def jwt_to_session_cookie(f):
 
         return f(*args, **kwargs)
     return wrapper
+
+
+@app.route('/api/zoffline/health', methods=['GET'])
+def zoffline_health():
+    """Desktop clients verify the target and multiplayer mode before joining."""
+    return jsonify({'service': 'zoffline', 'multiplayer': MULTIPLAYER})
 
 
 @app.route("/signup/", methods=["GET", "POST"])

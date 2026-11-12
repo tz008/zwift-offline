@@ -27,7 +27,7 @@ a = Analysis(
     hiddenimports=['standalone'],
     hookspath=[],
     runtime_hooks=[],
-    excludes=['tkinter', '_tkinter'],
+    excludes=[],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
@@ -39,6 +39,6 @@ exe = EXE(
     strip=False,
     upx=False,
     runtime_tmpdir=None,
-    console=True,
+    console=False,
     uac_admin=False,
 )

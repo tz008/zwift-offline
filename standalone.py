@@ -233,6 +233,8 @@ def encode_packet(payload, key, iv, ri, ci, sn):
 class TCPHandler(socketserver.BaseRequestHandler):
     def handle(self):
         self.data = self.request.recv(1024)
+        if not self.data:
+            return  # A desktop connection check opens then closes the socket.
         ip = self.client_address[0] + str(self.client_address[1])
         if not ip in global_clients.keys():
             relay_id = int.from_bytes(self.data[3:7], "big")

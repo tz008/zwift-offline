@@ -176,6 +176,9 @@ class LauncherTests(unittest.TestCase):
     def setUp(self):
         self.preflight = patch.object(windows_launcher, 'preflight_ports').start()
         self.elevation = patch.object(windows_launcher, '_is_elevated', return_value=True).start()
+        # These regressions exercise the retained local startup path. The new
+        # default main entry opens a window; test that dispatch separately.
+        self.gui = patch('windows_gui.run_gui', side_effect=windows_launcher.run_local).start()
         self.addCleanup(patch.stopall)
 
     def test_absence_shows_exact_prompt_and_never_starts_server(self):
