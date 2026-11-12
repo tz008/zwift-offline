@@ -10,6 +10,133 @@ from zwift_installation import find_zwift_installation
 from windows_launcher import runtime_directory
 from windows_network import list_lan_addresses, probe_server, validate_server_ip
 from windows_session import DesktopSession, load_settings, validate_options
+from windows_bot_config import (BOT_DEFAULTS, BotConfigError, load_bot_config,
+                                save_bot_config, solo_player_id)
+
+
+class BotConfigDialog(tk.Toplevel):
+    """A modal editor; only Save applies the draft to the next server start."""
+
+    def __init__(self, parent, directory, config, on_saved):
+        super().__init__(parent)
+        self.directory = directory
+        self.initial_config = dict(config)
+        self.defaults_restored = False
+        self.on_saved = on_saved
+        self.title('机器人配置 · zoffline')
+        self.transient(parent)
+        self.resizable(False, False)
+        self.protocol('WM_DELETE_WINDOW', self.cancel)
+        self.bind('<Escape>', lambda _: self.cancel())
+        self.variables = {}
+        for key, default in BOT_DEFAULTS.items():
+            variable = tk.BooleanVar if isinstance(default, bool) else tk.StringVar
+            self.variables[key] = variable(self, value=config[key])
+        self.error = tk.StringVar(self)
+        self.fields = {}
+        self._build()
+        self._update_fields()
+        self.update_idletasks()
+        x = max(0, parent.winfo_rootx() + (parent.winfo_width() - self.winfo_reqwidth()) // 2)
+        y = max(0, parent.winfo_rooty() + (parent.winfo_height() - self.winfo_reqheight()) // 2)
+        self.geometry('+%d+%d' % (x, y))
+        self.grab_set()
+
+    def _build(self):
+        outer = ttk.Frame(self, padding=20)
+        outer.pack(fill='both', expand=True)
+        outer.columnconfigure(0, weight=1)
+        ttk.Label(outer, text='单机跟骑机器人', font=('Microsoft YaHei UI', 16, 'bold')).grid(
+            row=0, sticky='w')
+        ttk.Label(outer, text='机器人围绕你跟骑，并随你的速度和路线移动。',
+                  style='Subtitle.TLabel').grid(row=1, sticky='w', pady=(4, 16))
+        self.tabs = ttk.Notebook(outer)
+        self.tabs.grid(row=2, sticky='nsew')
+        self.basic_tab = basic = ttk.Frame(self.tabs, padding=16)
+        self.advanced_tab = advanced = ttk.Frame(self.tabs, padding=16)
+        self.tabs.add(basic, text='基本设置')
+        self.tabs.add(advanced, text='队形与节奏')
+        ttk.Checkbutton(basic, text='启用跟骑机器人', variable=self.variables['enabled']).grid(
+            row=0, column=0, columnspan=3, sticky='w', pady=(0, 16))
+        ttk.Label(basic, text='机器人人数').grid(row=1, column=0, sticky='w')
+        self.fields['riders'] = ttk.Spinbox(basic, from_=1, to=30, width=10,
+                                          textvariable=self.variables['riders'])
+        self.fields['riders'].grid(row=1, column=1, sticky='w', padx=(18, 10))
+        ttk.Label(basic, text='人（1–30）', style='Subtitle.TLabel').grid(row=1, column=2, sticky='w')
+        ttk.Label(basic, text='跟骑队形').grid(row=2, column=0, sticky='w', pady=(18, 6))
+        formation = ttk.Frame(basic)
+        formation.grid(row=3, column=0, columnspan=3, sticky='w', pady=(0, 16))
+        for index, (value, label) in enumerate(((True, '自然散开'), (False, '整齐列队'))):
+            ttk.Radiobutton(formation, text=label, variable=self.variables['scatter'], value=value,
+                            command=self._update_fields).grid(row=0, column=index, padx=(0, 28))
+        ttk.Checkbutton(basic, text='自动轮流领骑', variable=self.variables['rotate'],
+                        command=self._update_fields).grid(row=4, column=0, columnspan=3, sticky='w', pady=5)
+        ttk.Checkbutton(basic, text='机器人主动打手势', variable=self.variables['bot_gestures']).grid(
+            row=5, column=0, columnspan=3, sticky='w', pady=5)
+        ttk.Label(basic, text='取消勾选并保存后，下次启动将关闭机器人，其他参数继续保留。',
+                  wraplength=440, style='Subtitle.TLabel').grid(
+                      row=6, column=0, columnspan=3, sticky='w', pady=(16, 4))
+        for row, (key, label, unit, hint) in enumerate((
+                ('row_gap', '前后排间距', '米', '整齐列队 · 0.5–10'),
+                ('lateral_spacing', '横向间距', '米', '两种队形 · 0.5–3'),
+                ('scatter_width', '散开宽度', '米', '自然散开 · 2–6.4'),
+                ('shuffle_interval', '位置交换间隔', '秒', '整齐列队 · 至少 5 秒'),
+                ('pull_interval', '领骑轮换间隔', '秒', '自动轮流领骑 · 至少 5 秒'))):
+            ttk.Label(advanced, text=label).grid(row=row, column=0, sticky='w', pady=10)
+            self.fields[key] = ttk.Entry(advanced, width=10, textvariable=self.variables[key])
+            self.fields[key].grid(row=row, column=1, padx=(18, 10))
+            ttk.Label(advanced, text=unit).grid(row=row, column=2, sticky='w')
+            ttk.Label(advanced, text=hint, style='Subtitle.TLabel').grid(
+                row=row, column=3, sticky='w', padx=(18, 0))
+        ttk.Label(advanced, text='自然散开时，横向间距不能超过散开宽度的一半。实际间距受道路宽度影响。',
+                  wraplength=440, style='Subtitle.TLabel').grid(
+                      row=5, column=0, columnspan=4, sticky='w', pady=(16, 4))
+        ttk.Label(outer, textvariable=self.error, foreground='#b42318', wraplength=470).grid(
+            row=3, sticky='w', pady=(12, 0))
+        ttk.Label(outer, text='未启用的参数保留上次保存值；保存后点击“启动 Zwift”生效。',
+                  wraplength=470, style='Subtitle.TLabel').grid(row=4, sticky='w', pady=(8, 14))
+        actions = ttk.Frame(outer)
+        actions.grid(row=5, sticky='ew')
+        ttk.Button(actions, text='恢复默认', command=self.reset_defaults).pack(side='left')
+        ttk.Button(actions, text='保存配置', command=self.save).pack(side='right', padx=(10, 0))
+        ttk.Button(actions, text='取消', command=self.cancel).pack(side='right')
+
+    def _update_fields(self):
+        scatter = self.variables['scatter'].get()
+        self.fields['row_gap'].configure(state='disabled' if scatter else 'normal')
+        self.fields['scatter_width'].configure(state='normal' if scatter else 'disabled')
+        self.fields['shuffle_interval'].configure(state='disabled' if scatter else 'normal')
+        self.fields['pull_interval'].configure(state='normal' if self.variables['rotate'].get() else 'disabled')
+
+    def reset_defaults(self):
+        self.defaults_restored = True
+        for key, value in BOT_DEFAULTS.items():
+            self.variables[key].set(value)
+        self.error.set('')
+        self._update_fields()
+
+    def save(self):
+        try:
+            self._update_fields()
+            values = {key: value.get() for key, value in self.variables.items()}
+            active = set(values)
+            for key, field in self.fields.items():
+                if field.instate(['disabled']):
+                    values[key] = (BOT_DEFAULTS if self.defaults_restored else self.initial_config)[key]
+                    active.discard(key)
+            config = save_bot_config(self.directory, values, edited_fields=active)
+        except BotConfigError as exc:
+            self.error.set(str(exc))
+            if exc.field in self.fields:
+                self.tabs.select(self.basic_tab if exc.field == 'riders' else self.advanced_tab)
+                self.fields[exc.field].focus_set()
+            return
+        self.on_saved(config)
+        self.cancel()
+
+    def cancel(self):
+        self.grab_release()
+        self.destroy()
 
 
 class LauncherWindow:
@@ -22,6 +149,7 @@ class LauncherWindow:
         self.checking = False
         self.closing = False
         self.addresses = []
+        self.bot_dialog = None
         settings = load_settings(self.directory)
         self.mode = tk.StringVar(value=settings['mode'])
         self.host_ip = tk.StringVar(value=settings['host_ip'])
@@ -30,6 +158,7 @@ class LauncherWindow:
         self.status = tk.StringVar(value='选择运行方式后启动。')
         self.installation = tk.StringVar(value='正在检查 Zwift 安装……')
         self.adapter = tk.StringVar(value='正在读取本机网卡……')
+        self.bot_summary = tk.StringVar()
         self._build()
         self._mode_changed()
         root.protocol('WM_DELETE_WINDOW', self.close)
@@ -70,6 +199,12 @@ class LauncherWindow:
         self.details.columnconfigure(0, weight=1)
         self.single_frame = ttk.Frame(self.details)
         ttk.Label(self.single_frame, text='在这台电脑启动服务并打开 Zwift。').pack(anchor='w')
+        bots = ttk.Frame(self.single_frame)
+        bots.pack(fill='x', pady=(10, 0))
+        self.bot_button = ttk.Button(bots, text='机器人配置…', command=self.configure_bots)
+        self.bot_button.pack(side='left')
+        ttk.Label(bots, textvariable=self.bot_summary, style='Subtitle.TLabel').pack(side='left', padx=(12, 0))
+        self.editable.append(self.bot_button)
         self.host_frame = ttk.Frame(self.details)
         self.host_frame.columnconfigure(1, weight=1)
         ttk.Label(self.host_frame, text='本机网卡 / IP').grid(row=0, column=0, padx=(0, 12))
@@ -124,6 +259,44 @@ class LauncherWindow:
                  '启动服务器并骑行' if self.mode.get() == 'host' else
                  '连接并启动 Zwift' if self.mode.get() == 'join' else '启动 Zwift')
         self.start_button.configure(text=label)
+        if self.mode.get() == 'single':
+            self._refresh_bot_summary()
+
+    def _refresh_bot_summary(self):
+        try:
+            self._set_bot_summary(load_bot_config(self.directory))
+        except BotConfigError:
+            self.bot_summary.set('配置无法读取，请点击“机器人配置”检查。')
+
+    def _set_bot_summary(self, config):
+        if config['enabled']:
+            try:
+                matches_player = int(config.get('player_id') or 1) == solo_player_id(self.directory)
+            except (TypeError, ValueError, OverflowError):
+                matches_player = False
+            if not matches_player:
+                self.bot_summary.set('机器人：请打开配置并保存，以应用到当前单机玩家。')
+                return
+        self.bot_summary.set('机器人：%s' % (
+            '%d 人 · %s' % (max(1, min(30, config['riders'])), '自然散开' if config['scatter'] else '整齐列队')
+            if config['enabled'] else '未启用'))
+
+    def configure_bots(self):
+        if self.busy or self.checking or self.mode.get() != 'single':
+            return
+        if self.bot_dialog is not None and self.bot_dialog.winfo_exists():
+            self.bot_dialog.lift()
+            return
+        try:
+            config = load_bot_config(self.directory)
+        except BotConfigError as exc:
+            messagebox.showerror('机器人配置', str(exc), parent=self.root)
+            return
+        self.bot_dialog = BotConfigDialog(self.root, self.directory, config, self._bots_saved)
+
+    def _bots_saved(self, config):
+        self._set_bot_summary(config)
+        self.status.set('机器人配置已保存，下次单机启动时生效。')
 
     def _adapter_changed(self):
         names = [row['name'] for row in self.addresses if row['ip'] == self.host_ip.get()]
@@ -176,12 +349,19 @@ class LauncherWindow:
         self.start_button.configure(state='disabled' if value or self.checking else 'normal')
         self.check_button.configure(state='disabled' if value or self.checking else 'normal')
         self.stop_button.configure(state='normal' if value else 'disabled')
+        if not value and self.mode.get() == 'single':
+            self._refresh_bot_summary()
 
     def start(self):
         if self.busy or self.checking:
             return
+        if self.bot_dialog is not None and self.bot_dialog.winfo_exists():
+            self.bot_dialog.lift()
+            return
         mode = self.mode.get()
         try:
+            if mode == 'single':
+                load_bot_config(self.directory)
             options = validate_options({'mode': mode, 'ride': self.ride.get(),
                                         'server_ip': self.join_ip.get() if mode == 'join' else self.host_ip.get()})
             settings = {'mode': mode, 'host_ip': self.host_ip.get(),

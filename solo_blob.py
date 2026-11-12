@@ -962,20 +962,14 @@ class SoloBlob:
                 used_slots.add(i)
 
     def _build_slots(self, count):
-        spacing = float(self.config['lateral_spacing'])
-        row_gap = float(self.config['row_gap'])
-        lead_gap = float(self.config.get('lead_gap', 1.6))
         # gestures reshape the formation: hammer = tight and lethal, toast =
         # loose and calm, bell = the player leads so nobody sits in front
         lead_count = None
         if self.mode == 'hammer':
-            row_gap, lead_gap = row_gap * 0.7, lead_gap * 0.75
             lead_count = min(3, max(1, count - 3))
         elif self.mode == 'attack':
-            row_gap, lead_gap = row_gap * 0.85, lead_gap * 0.85
             lead_count = max(1, min(3, (count - 1) // 3)) if count >= 4 else 0
         elif self.mode == 'toast':
-            row_gap = row_gap * 1.15
             lead_count = max(1, min(2, (count - 1) // 4)) if count >= 5 else 0
         elif self.mode == 'lead':
             lead_count = 0
@@ -985,13 +979,43 @@ class SoloBlob:
             rows = self.lead_rows_now
         else:
             rows = [1] * self._lead_count(count)
+        fallback = False
         if self._cfg_bool('scatter', False):
-            return self._scatter_slots(count, sum(rows))
+            self._ensure_pools()
+            in_front = min(sum(rows), len(self.scatter_front), count)
+            available = in_front + len(self.scatter_tail)
+            if available >= count:
+                self._scatter_capacity_fallback = False
+                return self._scatter_slots(count, sum(rows))
+            # Manual spacing constraints can leave too few sampled positions,
+            # especially when the bell moves every rider behind the player.
+            # Check before _resize_set can create indices beyond the pool.
+            if not getattr(self, '_scatter_capacity_fallback', False):
+                self.logger.warning('[SoloBlob] player %d scattered layout has %d/%d slots; '
+                                    'using default row formation' % (self.player_id, available, count))
+            self._scatter_capacity_fallback = True
+            self._carry_fresh = False
+            fallback = True
+        else:
+            self._scatter_capacity_fallback = False
+
+        # Use known safe row settings only for the capacity fallback. Hidden
+        # hand-edited row_gap/columns may be unsuitable for an ordered layout.
+        row_config = DEFAULT_CONFIG if fallback else self.config
+        spacing = float(row_config['lateral_spacing'])
+        row_gap = float(row_config['row_gap'])
+        lead_gap = float(row_config.get('lead_gap', 1.6))
+        if self.mode == 'hammer':
+            row_gap, lead_gap = row_gap * 0.7, lead_gap * 0.75
+        elif self.mode == 'attack':
+            row_gap, lead_gap = row_gap * 0.85, lead_gap * 0.85
+        elif self.mode == 'toast':
+            row_gap *= 1.15
 
         slots = []
         lead_pos = 0.0
         single_side = 1
-        lead_lateral = float(self.config.get('lead_lateral', LEAD_LATERAL_M))
+        lead_lateral = float(row_config.get('lead_lateral', LEAD_LATERAL_M))
         for i, size in enumerate(rows):
             size = min(size, count - len(slots))
             if size <= 0:
@@ -1005,7 +1029,8 @@ class SoloBlob:
                 laterals = [(j - (size - 1) / 2) * pitch for j in range(size)]
             slots.extend((-lead_pos, lateral) for lateral in laterals)
         # the whole group in front stays close to you: no big gaps, whatever the formation
-        max_lead = clamp(self._cfg_float('max_lead', 9.0), 2.0, MAX_LEAD_M - 1.0)
+        max_lead = clamp(DEFAULT_CONFIG['max_lead'] if fallback else self._cfg_float('max_lead', 9.0),
+                         2.0, MAX_LEAD_M - 1.0)
         if slots and lead_pos > max_lead:
             squeeze = max_lead / lead_pos
             slots = [(gap * squeeze, lateral) for gap, lateral in slots]
@@ -1019,9 +1044,9 @@ class SoloBlob:
             # the rest sits in staggered rows; as wide as needed to keep the tail
             # within tail_gap (up to 5 abreast), more rows only for big groups
             rest = remaining - 2
-            rows_fit = max(1, int((float(self.config.get('tail_gap', 4.0)) - PULL_MIN_GAP) / row_gap + 1e-6))
-            columns = int(self.config['columns']) or clamp(-(-rest // rows_fit), 2, 5)
-            ragged = self._cfg_bool('ragged_rows', False)
+            rows_fit = max(1, int((float(row_config.get('tail_gap', 4.0)) - PULL_MIN_GAP) / row_gap + 1e-6))
+            columns = int(row_config['columns']) or clamp(-(-rest // rows_fit), 2, 5)
+            ragged = False if fallback else self._cfg_bool('ragged_rows', False)
             row = 1
             while len(slots) < count:
                 if ragged:
