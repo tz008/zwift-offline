@@ -49,6 +49,7 @@ coverage.xml
 # Editor settings, temporary files and OS metadata
 .idea/
 .vscode/
+.workbuddy/
 *.swp
 *.swo
 *.tmp
