@@ -318,6 +318,90 @@ class BotConfigTests(unittest.TestCase):
         blob._rotate_line()
         self.assert_complete_slots(blob, 30)
 
+    def test_custom_names_keep_blank_positions_and_internal_spaces_in_ascii_json(self):
+        saved = config.save_bot_config(self.directory, {
+            'custom_names': ['  小明  ', '', '  Team  Rider ', '骑行😄']})
+        self.assertEqual(saved['custom_names'], ['小明', '', 'Team  Rider', '骑行😄'])
+        self.assertEqual(config.load_bot_config(self.directory)['custom_names'], saved['custom_names'])
+        self.assertTrue(self.path.read_bytes().isascii())
+        config.save_bot_config(self.directory, {'custom_names': [' ', '', '  ']})
+        self.assertEqual(config.load_bot_config(self.directory)['custom_names'], [])
+
+    def test_invalid_custom_names_identify_the_line_without_changing_file(self):
+        self.write({'custom_names': ['Original']})
+        original = self.path.read_bytes()
+        for value, line in ((['Valid', 'x' * 41], 2), (['Name'] * 31, 31),
+                            (['Valid', None], 2), (['Valid', 'Bad\tName'], 2),
+                            (['Valid', '\ud800'], 2), (['Valid', 'Bad\u2028Name'], 2),
+                            ('single string', None), ({'name': 'value'}, None)):
+            with self.subTest(value=repr(value)), self.assertRaises(config.BotConfigError) as error:
+                config.save_bot_config(self.directory, {'custom_names': value})
+            self.assertEqual(error.exception.field, 'custom_names')
+            self.assertEqual(error.exception.line, line)
+            self.assertEqual(self.path.read_bytes(), original)
+        # Limits count Unicode code points, including non-BMP characters.
+        saved = config.save_bot_config(self.directory, {'custom_names': ['😄' * 40]})
+        self.assertEqual(saved['custom_names'], ['😄' * 40])
+
+    def test_real_profiles_use_whole_custom_names_and_keep_blank_entry_random(self):
+        config.save_bot_config(self.directory, {'enabled': True, 'riders': 3,
+                                                'custom_names': ['小明', '', 'Team  Rider']})
+        manager = self.manager()
+        manager.names_provider = lambda: [{'first_name': 'Random', 'last_name': 'Rider',
+                                          'ride_jersey': 1234}]
+        manager.load()
+        blob = manager.blobs[1]
+        for rider, expected in zip(blob.riders, (('', '小明'), ('Random', 'Rider'), ('', 'Team  Rider'))):
+            profile = type(rider.profile).FromString(rider.profile.SerializeToString())
+            self.assertEqual((profile.first_name, profile.last_name), expected)
+            self.assertEqual(profile.ride_jersey, 1234)
+        manager.send_update = lambda *_: None
+        for index, rider in enumerate(blob.riders):
+            rider.gap = 0 if index == 0 else 10
+        self.assertIn('Rider 小明 ', manager.chat_command(1, 'bot wave'))
+
+    def test_custom_name_order_survives_roster_count_changes_and_new_ride(self):
+        expected = ['小明', '', 'Team Rider']
+        config.save_bot_config(self.directory, {'enabled': True, 'riders': 3, 'custom_names': expected})
+        manager = self.manager()
+        manager.load()
+        module = sys.modules['solo_blob']
+        manager.chat_command(1, 'new')
+        self.assertEqual(manager.blobs[1].riders[0].profile.last_name, '小明')
+        config.save_bot_config(self.directory, {'riders': 1})
+        manager.load()
+        self.assertEqual(len(manager.blobs[1].riders), 1)
+        self.assertEqual(manager.blobs[1].riders[0].profile.last_name, '小明')
+        self.assertEqual(config.load_bot_config(self.directory)['custom_names'], expected)
+        config.save_bot_config(self.directory, {'riders': 3})
+        manager.load()
+        blob = manager.blobs[1]
+        self.assertEqual(blob.riders[2].profile.last_name, 'Team Rider')
+        blob.trail.reset()
+        for x, road_time in ((1000, 100000), (2000, 110000)):
+            state = module.udp_node_msgs_pb2.PlayerState(id=1, x=x, z=100, roadTime=road_time,
+                roadPosition=10000000, speed=36000000, power=150)
+            blob.on_state(state)
+        with patch.object(blob, 'reroll', wraps=blob.reroll) as reroll:
+            blob.update(module.TICK_SECONDS)
+        reroll.assert_called_once_with()
+        self.assertEqual(blob.riders[0].profile.last_name, '小明')
+        self.assertEqual(blob.riders[2].profile.last_name, 'Team Rider')
+
+    def test_no_custom_names_preserves_original_random_profile_names(self):
+        config.save_bot_config(self.directory, {'enabled': True, 'riders': 2})
+        manager = self.manager()
+        manager.names_provider = lambda: [{'first_name': 'Random', 'last_name': 'Name'}]
+        manager.load()
+        self.assertEqual([(r.profile.first_name, r.profile.last_name) for r in manager.blobs[1].riders],
+                         [('Random', 'Name'), ('Random', 'Name')])
+        config.save_bot_config(self.directory, {'custom_names': ['Custom']})
+        manager.load()
+        self.assertEqual(manager.blobs[1].riders[0].profile.last_name, 'Custom')
+        config.save_bot_config(self.directory, {'custom_names': []})
+        manager.load()
+        self.assertEqual(manager.blobs[1].riders[0].profile.first_name, 'Random')
+
 
 if __name__ == '__main__':
     unittest.main()

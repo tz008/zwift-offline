@@ -5,6 +5,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+import unicodedata
 
 
 # Keep these public UI defaults aligned with solo_blob.DEFAULT_CONFIG. The
@@ -20,6 +21,7 @@ BOT_DEFAULTS = {
     'scatter_width': 3.0,
     'shuffle_interval': 25,
     'pull_interval': 60,
+    'custom_names': [],
 }
 NUMERIC_FIELDS = {
     'row_gap': ('前后排间距', 0.5, 10.0),
@@ -33,9 +35,10 @@ BOOLEAN_FIELDS = ('enabled', 'scatter', 'rotate', 'bot_gestures')
 
 
 class BotConfigError(ValueError):
-    def __init__(self, message, field=None):
+    def __init__(self, message, field=None, line=None):
         super().__init__(message)
         self.field = field
+        self.line = line
 
 
 def bot_config_path(directory):
@@ -81,10 +84,34 @@ def _read_config(path):
     return config
 
 
+def normalize_custom_names(names):
+    if not isinstance(names, list):
+        raise BotConfigError('自定义名称必须是字符串数组。', 'custom_names')
+    result = []
+    for line, value in enumerate(names, 1):
+        if not isinstance(value, str):
+            raise BotConfigError('第 %d 行自定义名称必须是文本。' % line, 'custom_names', line)
+        if any(unicodedata.category(char) in ('Cc', 'Cs', 'Zl', 'Zp') for char in value):
+            raise BotConfigError('第 %d 行名称含控制字符或无效 Unicode 字符。' % line,
+                                 'custom_names', line)
+        value = value.strip()
+        if len(value) > 40:
+            raise BotConfigError('第 %d 行名称最多 40 个字符。' % line, 'custom_names', line)
+        result.append(value)
+    # A pasted terminating newline does not name another rider. Empty lines
+    # inside the list keep their fixed rider positions.
+    while result and not result[-1]:
+        result.pop()
+    if len(result) > 30:
+        raise BotConfigError('自定义名称最多 30 行，请删除第 31 行及之后的名称。', 'custom_names', 31)
+    return result
+
+
 def validate_bot_config(config, *, strict=True, fields=None):
     """Keep old finite values readable; apply UI limits only to edited fields."""
     values = dict(BOT_DEFAULTS)
     values.update({key: config[key] for key in BOT_DEFAULTS if key in config})
+    values['custom_names'] = normalize_custom_names(values['custom_names'])
     fields = set(BOT_DEFAULTS if fields is None else fields) if strict else set()
     for key in BOOLEAN_FIELDS:
         if type(values[key]) is not bool:

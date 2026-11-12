@@ -295,6 +295,76 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(saved['scatter_width'], 2)
         self.assertEqual(saved['lateral_spacing'], 3)
 
+    def test_custom_names_save_reopen_and_cancel_preserve_line_order(self):
+        self.window.configure_bots()
+        dialog = self.window.bot_dialog
+        dialog.names_text.insert('1.0', '  小明  \n\nTeam  Rider')
+        dialog.save()
+        self.assertFalse(dialog.winfo_exists())
+        saved = json.loads(bot_config_path(self.directory).read_text())
+        self.assertEqual(saved['custom_names'], ['小明', '', 'Team  Rider'])
+        original = bot_config_path(self.directory).read_bytes()
+        self.window.configure_bots()
+        reopened = self.window.bot_dialog
+        self.assertEqual(reopened.names_text.get('1.0', 'end-1c'), '小明\n\nTeam  Rider')
+        reopened.names_text.delete('1.0', 'end')
+        reopened.names_text.insert('1.0', 'Discarded')
+        reopened.cancel()
+        self.assertEqual(bot_config_path(self.directory).read_bytes(), original)
+
+    def test_invalid_custom_name_selects_names_tab_and_keeps_file(self):
+        save_bot_config(self.directory, {'custom_names': ['Original']})
+        original = bot_config_path(self.directory).read_bytes()
+        self.window.configure_bots()
+        dialog = self.window.bot_dialog
+        dialog.names_text.delete('1.0', 'end')
+        dialog.names_text.insert('1.0', 'Valid\n' + '长' * 41)
+        dialog.tabs.select(dialog.basic_tab)
+        dialog.save()
+        self.assertTrue(dialog.winfo_exists())
+        self.assertEqual(dialog.tabs.select(), str(dialog.names_tab))
+        self.assertIn('第 2 行', dialog.error.get())
+        self.assertEqual(dialog.names_text.index('insert'), '2.0')
+        self.assertTrue(dialog.names_text.tag_ranges('invalid-name'))
+        self.assertEqual(bot_config_path(self.directory).read_bytes(), original)
+        dialog.cancel()
+
+    def test_clearing_names_restores_random_and_reset_defaults_only_edits_draft(self):
+        save_bot_config(self.directory, {'custom_names': ['Original']})
+        original = bot_config_path(self.directory).read_bytes()
+        self.window.configure_bots()
+        dialog = self.window.bot_dialog
+        dialog.reset_defaults()
+        self.assertEqual(dialog.names_text.get('1.0', 'end-1c'), '')
+        dialog.cancel()
+        self.assertEqual(bot_config_path(self.directory).read_bytes(), original)
+        self.window.configure_bots()
+        dialog = self.window.bot_dialog
+        dialog.names_text.delete('1.0', 'end')
+        dialog.save()
+        self.assertEqual(json.loads(bot_config_path(self.directory).read_text())['custom_names'], [])
+
+    def test_reducing_rider_count_keeps_unused_custom_names_in_editor(self):
+        save_bot_config(self.directory, {'riders': 3, 'custom_names': ['One', '', 'Three']})
+        self.window.configure_bots()
+        dialog = self.window.bot_dialog
+        dialog.variables['riders'].set('1')
+        dialog.save()
+        self.window.configure_bots()
+        dialog = self.window.bot_dialog
+        self.assertEqual(dialog.variables['riders'].get(), '1')
+        self.assertEqual(dialog.names_text.get('1.0', 'end-1c'), 'One\n\nThree')
+        dialog.cancel()
+
+    def test_pasting_thirty_names_with_a_terminating_newline_is_accepted(self):
+        names = ['Rider %d' % index for index in range(1, 31)]
+        self.window.configure_bots()
+        dialog = self.window.bot_dialog
+        dialog.names_text.insert('1.0', '\n'.join(names) + '\n')
+        dialog.save()
+        self.assertFalse(dialog.winfo_exists())
+        self.assertEqual(json.loads(bot_config_path(self.directory).read_text())['custom_names'], names)
+
 
 if __name__ == '__main__':
     unittest.main()

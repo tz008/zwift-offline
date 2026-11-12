@@ -130,6 +130,7 @@ DROP_SIDE_M = 1.3                    # sideways offset of the old leader while h
 DEFAULT_CONFIG = {
     'enabled': False,
     'riders': 8,
+    'custom_names': [],              # fixed rider order; empty entries keep the random name
     'row_gap': 1.8,                 # meters between rows (staggered, a bike is ~1.8 m long)
     'tail_gap': 4.0,                # the group tries to stay within this many meters behind you
     'lateral_spacing': 0.95,          # meters between riders side to side
@@ -809,6 +810,14 @@ class SoloBlob:
         profile.id = self._rider_id(i)
         profile.first_name = name.get('first_name') or 'Rider'
         profile.last_name = name.get('last_name') or str(i)
+        custom_names = self.config.get('custom_names', [])
+        if isinstance(custom_names, list) and i < len(custom_names):
+            custom_name = custom_names[i]
+            if isinstance(custom_name, str) and custom_name.strip():
+                # Zwift abbreviates first names; keep a custom display name
+                # whole, including spaces and single-word Chinese names.
+                profile.first_name = ''
+                profile.last_name = custom_name.strip()
         profile.is_male = bool(name.get('is_male', bool(rng.getrandbits(1))))
         profile.country_code = name.get('country_code') or 804
         profile.weight_in_grams = round(rng.uniform(62, 86) * 1000)
@@ -1910,7 +1919,8 @@ class SoloBlobManager:
                     return 'Usage (blob running): .blob bot %s' % '|'.join(blob_gestures.ACTION_WORDS)
                 rider = min(blob.riders, key=lambda r: abs(r.gap))
                 self._emit_gesture(blob, rider, action)
-                return 'Rider %s (gap %.1f m) signals %s.' % (rider.profile.first_name, rider.gap, word)
+                name = ' '.join(part for part in (rider.profile.first_name, rider.profile.last_name) if part)
+                return 'Rider %s (gap %.1f m) signals %s.' % (name, rider.gap, word)
             if args in gesture_words:
                 blob = self.blobs.get(player_id)
                 if not blob:

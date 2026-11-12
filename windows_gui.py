@@ -30,6 +30,8 @@ class BotConfigDialog(tk.Toplevel):
         self.bind('<Escape>', lambda _: self.cancel())
         self.variables = {}
         for key, default in BOT_DEFAULTS.items():
+            if key == 'custom_names':
+                continue
             variable = tk.BooleanVar if isinstance(default, bool) else tk.StringVar
             self.variables[key] = variable(self, value=config[key])
         self.error = tk.StringVar(self)
@@ -56,6 +58,22 @@ class BotConfigDialog(tk.Toplevel):
         self.advanced_tab = advanced = ttk.Frame(self.tabs, padding=16)
         self.tabs.add(basic, text='基本设置')
         self.tabs.add(advanced, text='队形与节奏')
+        self.names_tab = ttk.Frame(self.tabs, padding=16)
+        self.tabs.add(self.names_tab, text='自定义名称')
+        ttk.Label(self.names_tab, text='每行对应一名机器人：第 1 行是 1 号，第 2 行是 2 号，以此类推。',
+                  wraplength=440).pack(anchor='w')
+        ttk.Label(self.names_tab, text='空行使用随机名称；最多 30 行，每个名称最多 40 个字符。',
+                  style='Subtitle.TLabel', wraplength=440).pack(anchor='w', pady=(6, 10))
+        self.names_text = scrolledtext.ScrolledText(self.names_tab, height=8, width=46,
+            wrap='none', font=('Microsoft YaHei UI', 10), undo=True)
+        self.names_text.pack(fill='both', expand=True)
+        self.names_text.insert('1.0', '\n'.join(self.initial_config['custom_names']))
+        horizontal = ttk.Scrollbar(self.names_tab, orient='horizontal', command=self.names_text.xview)
+        horizontal.pack(fill='x')
+        self.names_text.configure(xscrollcommand=horizontal.set)
+        self.names_text.tag_configure('invalid-name', background='#fde8e8')
+        ttk.Label(self.names_tab, text='减少人数会保留多出的名称；换阵容也会保留名称顺序。',
+                  wraplength=440, style='Subtitle.TLabel').pack(anchor='w', pady=(10, 0))
         ttk.Checkbutton(basic, text='启用跟骑机器人', variable=self.variables['enabled']).grid(
             row=0, column=0, columnspan=3, sticky='w', pady=(0, 16))
         ttk.Label(basic, text='机器人人数').grid(row=1, column=0, sticky='w')
@@ -111,7 +129,11 @@ class BotConfigDialog(tk.Toplevel):
     def reset_defaults(self):
         self.defaults_restored = True
         for key, value in BOT_DEFAULTS.items():
+            if key == 'custom_names':
+                continue
             self.variables[key].set(value)
+        self.names_text.delete('1.0', 'end')
+        self.names_text.tag_remove('invalid-name', '1.0', 'end')
         self.error.set('')
         self._update_fields()
 
@@ -119,6 +141,9 @@ class BotConfigDialog(tk.Toplevel):
         try:
             self._update_fields()
             values = {key: value.get() for key, value in self.variables.items()}
+            names = self.names_text.get('1.0', 'end-1c')
+            values['custom_names'] = [] if names == '' else names.split('\n')
+            self.names_text.tag_remove('invalid-name', '1.0', 'end')
             active = set(values)
             for key, field in self.fields.items():
                 if field.instate(['disabled']):
@@ -127,7 +152,14 @@ class BotConfigDialog(tk.Toplevel):
             config = save_bot_config(self.directory, values, edited_fields=active)
         except BotConfigError as exc:
             self.error.set(str(exc))
-            if exc.field in self.fields:
+            if exc.field == 'custom_names':
+                self.tabs.select(self.names_tab)
+                self.names_text.focus_set()
+                line = exc.line or 1
+                self.names_text.mark_set('insert', '%d.0' % line)
+                self.names_text.see('%d.0' % line)
+                self.names_text.tag_add('invalid-name', '%d.0' % line, '%d.end' % line)
+            elif exc.field in self.fields:
                 self.tabs.select(self.basic_tab if exc.field == 'riders' else self.advanced_tab)
                 self.fields[exc.field].focus_set()
             return
