@@ -15,9 +15,9 @@ from windows_bot_config import (BOT_DEFAULTS, BotConfigError, load_bot_config,
 
 
 class BotConfigDialog(tk.Toplevel):
-    """A modal editor; only Save applies the draft to the next server start."""
+    """A modal editor; Save applies the draft to the running local server."""
 
-    def __init__(self, parent, directory, config, on_saved):
+    def __init__(self, parent, directory, config, on_saved, live=False):
         super().__init__(parent)
         self.directory = directory
         self.initial_config = dict(config)
@@ -35,8 +35,11 @@ class BotConfigDialog(tk.Toplevel):
             variable = tk.BooleanVar if isinstance(default, bool) else tk.StringVar
             self.variables[key] = variable(self, value=config[key])
         self.error = tk.StringVar(self)
+        self.save_hint = tk.StringVar(self)
+        self.enabled_hint = tk.StringVar(self)
         self.fields = {}
         self._build()
+        self.set_live(live)
         self._update_fields()
         self.update_idletasks()
         x = max(0, parent.winfo_rootx() + (parent.winfo_width() - self.winfo_reqwidth()) // 2)
@@ -91,7 +94,7 @@ class BotConfigDialog(tk.Toplevel):
                         command=self._update_fields).grid(row=4, column=0, columnspan=3, sticky='w', pady=5)
         ttk.Checkbutton(basic, text='机器人主动打手势', variable=self.variables['bot_gestures']).grid(
             row=5, column=0, columnspan=3, sticky='w', pady=5)
-        ttk.Label(basic, text='取消勾选并保存后，下次启动将关闭机器人，其他参数继续保留。',
+        ttk.Label(basic, textvariable=self.enabled_hint,
                   wraplength=440, style='Subtitle.TLabel').grid(
                       row=6, column=0, columnspan=3, sticky='w', pady=(16, 4))
         for row, (key, label, unit, hint) in enumerate((
@@ -111,13 +114,19 @@ class BotConfigDialog(tk.Toplevel):
                       row=5, column=0, columnspan=4, sticky='w', pady=(16, 4))
         ttk.Label(outer, textvariable=self.error, foreground='#b42318', wraplength=470).grid(
             row=3, sticky='w', pady=(12, 0))
-        ttk.Label(outer, text='未启用的参数保留上次保存值；保存后点击“启动 Zwift”生效。',
+        ttk.Label(outer, textvariable=self.save_hint,
                   wraplength=470, style='Subtitle.TLabel').grid(row=4, sticky='w', pady=(8, 14))
         actions = ttk.Frame(outer)
         actions.grid(row=5, sticky='ew')
         ttk.Button(actions, text='恢复默认', command=self.reset_defaults).pack(side='left')
         ttk.Button(actions, text='保存配置', command=self.save).pack(side='right', padx=(10, 0))
         ttk.Button(actions, text='取消', command=self.cancel).pack(side='right')
+
+    def set_live(self, live):
+        self.save_hint.set('本机服务运行中：保存后约 1 秒更新当前骑行。未启用的参数保留上次保存值。'
+                           if live else '配置会保留到下次单机启动；未启用的参数保留上次保存值。')
+        self.enabled_hint.set('取消勾选并保存后，当前骑行的机器人会移除，其他参数保留。'
+                              if live else '取消勾选并保存后，下次启动将关闭机器人，其他参数保留。')
 
     def _update_fields(self):
         scatter = self.variables['scatter'].get()
@@ -178,6 +187,8 @@ class LauncherWindow:
         self.events = queue.SimpleQueue()
         self.session = DesktopSession(self.directory, self.emit)
         self.busy = False
+        self.running = False
+        self.stopping = False
         self.checking = False
         self.closing = False
         self.addresses = []
@@ -291,6 +302,7 @@ class LauncherWindow:
                  '启动服务器并骑行' if self.mode.get() == 'host' else
                  '连接并启动 Zwift' if self.mode.get() == 'join' else '启动 Zwift')
         self.start_button.configure(text=label)
+        self._update_bot_controls()
         if self.mode.get() == 'single':
             self._refresh_bot_summary()
 
@@ -314,7 +326,7 @@ class LauncherWindow:
             if config['enabled'] else '未启用'))
 
     def configure_bots(self):
-        if self.busy or self.checking or self.mode.get() != 'single':
+        if not self._can_configure_bots():
             return
         if self.bot_dialog is not None and self.bot_dialog.winfo_exists():
             self.bot_dialog.lift()
@@ -324,11 +336,22 @@ class LauncherWindow:
         except BotConfigError as exc:
             messagebox.showerror('机器人配置', str(exc), parent=self.root)
             return
-        self.bot_dialog = BotConfigDialog(self.root, self.directory, config, self._bots_saved)
+        self.bot_dialog = BotConfigDialog(self.root, self.directory, config, self._bots_saved, live=self.running)
 
     def _bots_saved(self, config):
         self._set_bot_summary(config)
-        self.status.set('机器人配置已保存，下次单机启动时生效。')
+        self.status.set('机器人配置已保存，当前骑行约 1 秒内更新。'
+                        if self.running and not self.stopping and not self.closing
+                        else '机器人配置已保存，下次单机启动时生效。')
+
+    def _can_configure_bots(self):
+        return (self.mode.get() == 'single' and not self.checking and not self.closing
+                and not self.stopping and (not self.busy or self.running))
+
+    def _update_bot_controls(self):
+        self.bot_button.configure(state='normal' if self._can_configure_bots() else 'disabled')
+        if self.bot_dialog is not None and self.bot_dialog.winfo_exists():
+            self.bot_dialog.set_live(self.running and not self.stopping and not self.closing)
 
     def _adapter_changed(self):
         names = [row['name'] for row in self.addresses if row['ip'] == self.host_ip.get()]
@@ -369,6 +392,7 @@ class LauncherWindow:
             messagebox.showerror('服务器地址', str(exc), parent=self.root)
             return
         self.checking = True
+        self._update_bot_controls()
         self.check_button.configure(state='disabled')
         self.start_button.configure(state='disabled')
         self.status.set('正在检测 %s……' % ip)
@@ -376,11 +400,14 @@ class LauncherWindow:
 
     def _set_busy(self, value):
         self.busy = value
+        self.running = False
+        self.stopping = False
         for widget in self.editable:
             widget.configure(state='disabled' if value else 'normal')
         self.start_button.configure(state='disabled' if value or self.checking else 'normal')
         self.check_button.configure(state='disabled' if value or self.checking else 'normal')
         self.stop_button.configure(state='normal' if value else 'disabled')
+        self._update_bot_controls()
         if not value and self.mode.get() == 'single':
             self._refresh_bot_summary()
 
@@ -412,6 +439,9 @@ class LauncherWindow:
 
     def stop(self):
         if self.busy and self._confirm_stop() and self.busy:
+            self.stopping = True
+            self.running = False
+            self._update_bot_controls()
             self.status.set('正在停止；若仍显示 Windows 授权窗口，请完成或取消授权。')
             self.stop_button.configure(state='disabled')
             self.session.stop()
@@ -425,6 +455,9 @@ class LauncherWindow:
         # finish and deliver its terminal event while that dialog is open.
         if self.busy:
             self.closing = True
+            self.stopping = True
+            self.running = False
+            self._update_bot_controls()
             self.status.set('正在退出并恢复配置……')
             self.stop_button.configure(state='disabled')
             self.session.stop()
@@ -451,14 +484,24 @@ class LauncherWindow:
                 self.status.set(value)
                 self._append_log(value)
             elif kind == 'running':
+                if not self.busy or self.stopping or self.closing:
+                    continue
+                self.running = True
+                self._update_bot_controls()
                 text = ('局域网服务器运行中：%s' % value['server_ip'] if value['mode'] == 'host' else
                         '已连接服务器：%s' % value['server_ip'] if value['mode'] == 'join' else '本机服务运行中。')
                 self.status.set(text)
                 self._append_log(text)
             elif kind == 'error':
                 self.closing = False
+                self.running = False
+                self._update_bot_controls()
                 self._append_log(value)
                 messagebox.showerror('zoffline', value, parent=self.root)
+            elif kind == 'stopping':
+                self.running = False
+                self.stopping = True
+                self._update_bot_controls()
             elif kind == 'stopped':
                 self._set_busy(False)
                 self.status.set('会话已停止，请查看错误信息。' if value else '已停止，本次临时配置已还原。')
@@ -475,6 +518,7 @@ class LauncherWindow:
                 self.installation.set(value)
             elif kind in ('probe', 'probe-error'):
                 self.checking = False
+                self._update_bot_controls()
                 self.check_button.configure(state='disabled' if self.busy else 'normal')
                 self.start_button.configure(state='disabled' if self.busy else 'normal')
                 self.status.set(value)

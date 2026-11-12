@@ -21,6 +21,7 @@ dictionary, world clock, names) are injected.
 """
 
 import json
+import copy
 import logging
 import math
 import os
@@ -69,8 +70,10 @@ def next_generation():
     return _generation
 
 
-CONFIG_CHECK_INTERVAL_SECONDS = 5
+CONFIG_CHECK_INTERVAL_SECONDS = 0.5
 TICK_SECONDS = 0.5
+MAX_RECENT_PLAYERS = 16
+MAX_RECENT_TRAIL_SAMPLES = 512
 
 # Zwift protocol units (PlayerState: speed in mm/h, x/y_altitude/z floats)
 MMH_PER_MS = 3600000
@@ -1703,14 +1706,24 @@ class SoloBlobManager:
         self.blobs = {}
         self.config_mtime = 0
         self.next_config_check = 0
+        self._applied_config = None
+        self._last_config_warning = None
+        self._recent_trails = {}
 
     # ---------- config ----------
 
-    def _read_config(self):
+    def _read_config(self, strict=False):
         try:
             with open(self.config_file) as f:
-                return json.load(f)
+                config = json.load(f)
+            if not isinstance(config, dict):
+                raise ValueError('Solo Blob configuration must be a JSON object')
+            return config
+        except FileNotFoundError:
+            return {}
         except Exception as exc:
+            if strict:
+                raise
             self.logger.warning('[SoloBlob] bad config %s: %s' % (self.config_file, repr(exc)))
             return {}
 
@@ -1724,32 +1737,119 @@ class SoloBlobManager:
 
     def _config_mtime(self):
         try:
-            return os.path.getmtime(self.config_file)
-        except OSError:
-            return 0
+            stat = os.stat(self.config_file)
+            return stat.st_mtime_ns, stat.st_size, stat.st_ino, stat.st_ctime_ns
+        except FileNotFoundError:
+            return None
+
+    @staticmethod
+    def _validate_config_numbers(entry):
+        # Preflight dormant settings too: update(0) skips them when the trail
+        # is stale, or until a rotation/gesture reaches a later branch. Keep
+        # finite manual values and their types, without imposing UI limits.
+        for key, default in DEFAULT_CONFIG.items():
+            if isinstance(default, bool) or not isinstance(default, (int, float)):
+                continue
+            if key == 'latency_comp' and entry[key] == 'auto':
+                continue
+            try:
+                if not math.isfinite(float(entry[key])):
+                    raise ValueError()
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError('Solo Blob %s must be a finite number' % key) from exc
+        for key in ('riders', 'columns', 'lead_spread', 'player_id'):
+            value = (entry.get(key) or 1) if key == 'player_id' else entry[key]
+            try:
+                int(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError('Solo Blob %s must support integer conversion' % key) from exc
+
+    def _warn_config_error(self, message, signature, exc):
+        warning = (message, signature, type(exc), str(exc))
+        if warning != self._last_config_warning:
+            self.logger.warning('[SoloBlob] %s: %s' % (message, repr(exc)))
+            self._last_config_warning = warning
+
+    def _candidate_blob(self, anchor, entry):
+        previous = self.blobs.get(anchor)
+        if previous and (previous.config['riders'], previous.config.get('custom_names', [])) == (
+                entry['riders'], entry.get('custom_names', [])):
+            # Validate layout changes on a private copy. The real trail is
+            # shared only after construction succeeds, under the state lock.
+            candidate = copy.deepcopy(previous, {id(previous.game_dictionary): previous.game_dictionary,
+                id(previous.logger): previous.logger, id(previous._names): previous._names})
+            candidate.config = entry
+            candidate.pending_gestures = []
+            candidate.slots = candidate._build_slots(len(candidate.riders))
+            candidate._assign_slots(sorted(candidate.riders, key=lambda rider: rider.gap))
+            candidate._reset_timers()
+        else:
+            names = []
+            try:
+                names = self.names_provider() or []
+            except Exception as exc:
+                self.logger.warning('[SoloBlob] names provider: %s' % repr(exc))
+            candidate = SoloBlob(anchor, 0, entry, names, self.game_dictionary, self.logger)
+            if previous:
+                for key in ('mode', 'mode_until', 'grade_now', 'grade_raw', 'live_speed',
+                            'live_accel', 'road_shift', 'stretch_now'):
+                    setattr(candidate, key, getattr(previous, key))
+                candidate.road_reach = dict(previous.road_reach)
+                candidate.slots = candidate._build_slots(len(candidate.riders))
+                for rider, old in zip(candidate.riders, previous.riders):
+                    rider.gap, rider.lateral, rider.rate = old.gap, old.lateral, old.rate
+        cached = self._recent_trails.get(anchor)
+        trail = previous.trail if previous else cached['trail'] if cached else candidate.trail
+        candidate.trail = copy.deepcopy(trail)
+        candidate._trail_resets = trail.resets
+        # Prepare a valid registry before replacing the old group. This also
+        # catches hand-edited settings that fail only once riding has begun.
+        riders = candidate.update(0)
+        candidate.trail = trail
+        return candidate, riders
 
     def load(self):
         with self.lock:
-            self.blobs = {}
-            if os.path.isfile(self.config_file):
-                self.config_mtime = self._config_mtime()
-                config = self._read_config()
+            signature = self.config_mtime
+            try:
+                signature = self._config_mtime()
+                config = self._read_config(strict=True)
+                if signature != self._config_mtime():
+                    return False   # Atomic replacement raced this read; try next tick.
+                entry = dict(DEFAULT_CONFIG)
+                entry.update(config)
                 if config.get('enabled'):
-                    entry = dict(DEFAULT_CONFIG)
-                    entry.update(config)
-                    entry['riders'] = clamp(int(entry.get('riders', 8)), 1, MAX_RIDERS)
+                    self._validate_config_numbers(entry)
                     anchor = int(entry.get('player_id') or 1)
-                    names = []
-                    try:
-                        names = self.names_provider() or []
-                    except Exception as exc:
-                        self.logger.warning('[SoloBlob] names provider: %s' % repr(exc))
-                    self.blobs[anchor] = SoloBlob(anchor, 0, entry, names, self.game_dictionary, self.logger)
+                    entry['player_id'] = anchor
+                    entry['riders'] = clamp(int(entry.get('riders', 8)), 1, MAX_RIDERS)
+                if entry == self._applied_config:
+                    self.config_mtime = signature
+                    self._last_config_warning = None
+                    return True
+                if config.get('enabled'):
+                    candidate, riders = self._candidate_blob(anchor, entry)
+                    self.blobs = {anchor: candidate}
+                    self._publish(riders)
                     self.logger.info('[SoloBlob] load - %d rider(s) around player %d'
                                     % (entry['riders'], anchor))
-                    return
-            self._publish({})
-            self.logger.info('[SoloBlob] load - disabled')
+                else:
+                    # Disabling must work even when an unused engine setting
+                    # is invalid; validate it only if it is enabled again.
+                    self.blobs = {}
+                    self._publish({})
+                    self.logger.info('[SoloBlob] load - disabled')
+                self._applied_config = entry
+                self.config_mtime = signature
+                self._last_config_warning = None
+                return True
+            except Exception as exc:
+                # A sharing/permission error may disappear without a file
+                # change. Keep the old signature so the next tick retries.
+                if not isinstance(exc, OSError):
+                    self.config_mtime = signature
+                self._warn_config_error('configuration update rejected; keeping current riders', signature, exc)
+                return False
 
     def _publish(self, riders):
         registry = {k: v for k, v in self.get_registry().items()
@@ -1762,19 +1862,46 @@ class SoloBlobManager:
         if now < self.next_config_check:
             return
         self.next_config_check = now + CONFIG_CHECK_INTERVAL_SECONDS
-        if self._config_mtime() != self.config_mtime:
+        try:
+            changed = self._config_mtime() != self.config_mtime
+        except OSError as exc:
+            self._warn_config_error('cannot inspect config', self.config_mtime, exc)
+            return
+        if changed:
             self.load()
+        else:
+            self._last_config_warning = None
 
     # ---------- state feed ----------
 
     def on_state(self, player_id, state):
         with self.lock:
+            if not state or not state.roadTime:
+                return
+            now = time.monotonic()
+            self._prune_recent_trails(now)
             blob = self.blobs.get(player_id)
+            cached = self._recent_trails.pop(player_id, None)
+            trail = blob.trail if blob else cached['trail'] if cached else Trail()
+            lag_s = None
+            if self.world_time and state.worldTime:
+                lag_s = clamp((self.world_time() - state.worldTime) / 1000.0, -5.0, 5.0)
             if blob:
-                lag_s = None
-                if self.world_time and state.worldTime:
-                    lag_s = clamp((self.world_time() - state.worldTime) / 1000.0, -5.0, 5.0)
                 blob.on_state(state, lag_s)
+            else:
+                trail.push(state, lag_s)
+            if len(trail.entries) > MAX_RECENT_TRAIL_SAMPLES:
+                base = trail.distances[-MAX_RECENT_TRAIL_SAMPLES]
+                trail.entries = trail.entries[-MAX_RECENT_TRAIL_SAMPLES:]
+                trail.distances = [distance - base for distance in trail.distances[-MAX_RECENT_TRAIL_SAMPLES:]]
+            self._recent_trails[player_id] = {'trail': trail, 'seen': now}
+            while len(self._recent_trails) > MAX_RECENT_PLAYERS:
+                self._recent_trails.pop(next(iter(self._recent_trails)))
+
+    def _prune_recent_trails(self, now):
+        for player_id, cached in list(self._recent_trails.items()):
+            if now - cached['seen'] > TRAIL_STALE_SECONDS:
+                self._recent_trails.pop(player_id)
 
     # ---------- gestures ----------
 
@@ -1811,8 +1938,9 @@ class SoloBlobManager:
     # ---------- tick ----------
 
     def tick(self, tick_seconds=TICK_SECONDS):
-        self._reload_if_needed()
         with self.lock:
+            self._prune_recent_trails(time.monotonic())
+            self._reload_if_needed()
             if not self.blobs:
                 return
             merged = {}

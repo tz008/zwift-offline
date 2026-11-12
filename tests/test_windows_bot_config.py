@@ -282,8 +282,8 @@ class BotConfigTests(unittest.TestCase):
         self.assert_complete_slots(blob, 22)
 
     def test_capacity_fallback_uses_safe_row_defaults_and_preserves_manual_values(self):
-        hidden = {'scatter_gap': 4, 'row_gap': 0, 'columns': -2, 'tail_gap': 'unused',
-                  'lead_gap': 'unused', 'lead_lateral': 'unused', 'max_lead': 'unused'}
+        hidden = {'scatter_gap': 4, 'row_gap': 0, 'columns': -2, 'tail_gap': 0,
+                  'lead_gap': 0, 'lead_lateral': -1, 'max_lead': 0}
         self.write(dict(hidden, enabled=True, riders=8))
         config.save_bot_config(self.directory, {'enabled': True, 'riders': 30,
             'scatter': True, 'scatter_width': 2, 'lateral_spacing': 1})

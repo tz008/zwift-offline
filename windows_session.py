@@ -279,6 +279,7 @@ class DesktopSession:
                 failure = str(exc)
                 self.emit('log', failure)
         finally:
+            self.emit('stopping', None)
             self.emit('status', '正在停止服务并恢复本次配置……')
             if server is not None:
                 try:

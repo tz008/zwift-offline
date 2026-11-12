@@ -118,6 +118,15 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.requests, [{'status': 'stop'}])
         self.assertIn(('error', 'bind failed'), self.events)
 
+    def test_explicit_stopping_event_precedes_server_and_system_cleanup(self):
+        observed = []
+        self.server.stop.side_effect = lambda: observed.append(('stopping', None) in self.events)
+        self.run_mode('single')
+        self.assertEqual(observed, [True])
+        self.assertLess(self.events.index(('stopping', None)),
+                        self.events.index(('status', '正在停止服务并恢复本次配置……')))
+        self.assert_restored()
+
     def test_cancelled_server_start_stops_and_restores_without_game(self):
         self.server.start.side_effect = session.SessionCancelled()
         self.run_mode('host')

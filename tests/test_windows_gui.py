@@ -187,7 +187,7 @@ class WindowTests(unittest.TestCase):
         self.assertTrue(dialog.fields['pull_interval'].instate(['disabled']))
         dialog.cancel()
 
-    def test_bot_page_cannot_be_opened_during_running_session(self):
+    def test_bot_page_cannot_be_opened_during_startup(self):
         self.window._set_busy(True)
         self.assertTrue(self.window.bot_button.instate(['disabled']))
         self.window.configure_bots()
@@ -364,6 +364,81 @@ class WindowTests(unittest.TestCase):
         dialog.save()
         self.assertFalse(dialog.winfo_exists())
         self.assertEqual(json.loads(bot_config_path(self.directory).read_text())['custom_names'], names)
+
+    def run_solo_session(self):
+        self.window._set_busy(True)
+        self.window.emit('running', {'mode': 'single', 'server_ip': '127.0.0.1'})
+        self.window._drain()
+
+    def test_running_solo_session_allows_bot_editor_while_other_controls_stay_frozen(self):
+        self.run_solo_session()
+        self.assertTrue(self.window.running)
+        self.assertFalse(self.window.bot_button.instate(['disabled']))
+        self.assertTrue(all(widget.instate(['disabled']) for widget in self.window.editable
+                            if widget is not self.window.bot_button))
+        self.window.configure_bots()
+        dialog = self.window.bot_dialog
+        self.assertIn('当前骑行', dialog.save_hint.get())
+        self.assertIn('当前骑行', dialog.enabled_hint.get())
+        dialog.variables['enabled'].set(True)
+        dialog.variables['riders'].set('5')
+        dialog.save()
+        self.assertIn('约 1 秒内更新', self.window.status.get())
+        self.assertTrue(self.window.busy)
+
+    def test_server_stops_while_editor_is_open_and_save_becomes_next_start_configuration(self):
+        self.run_solo_session()
+        self.window.configure_bots()
+        dialog = self.window.bot_dialog
+        self.window.emit('stopping', None)
+        self.window._drain()
+        self.assertFalse(self.window.running)
+        self.assertTrue(self.window.bot_button.instate(['disabled']))
+        self.assertIn('下次单机启动', dialog.save_hint.get())
+        self.window.emit('stopped', None)
+        self.window._drain()
+        dialog.variables['riders'].set('7')
+        dialog.save()
+        self.assertIn('下次单机启动', self.window.status.get())
+        self.assertEqual(json.loads(bot_config_path(self.directory).read_text())['riders'], 7)
+        self.assertFalse(self.window.busy)
+
+    def test_stop_request_disables_bot_editor_and_late_running_event_cannot_reopen_it(self):
+        self.run_solo_session()
+        with patch.object(self.window, '_confirm_stop', return_value=True):
+            self.window.stop()
+        self.window.emit('running', {'mode': 'single', 'server_ip': '127.0.0.1'})
+        self.window._drain()
+        self.assertFalse(self.window.running)
+        self.assertTrue(self.window.stopping)
+        self.window.configure_bots()
+        self.assertIsNone(self.window.bot_dialog)
+        self.window.session.stop.assert_called_once()
+
+    def test_running_host_never_enables_single_player_bot_editor(self):
+        self.window.mode.set('host')
+        self.window._mode_changed()
+        self.window._set_busy(True)
+        self.window.emit('running', {'mode': 'host', 'server_ip': '192.168.1.5'})
+        self.window._drain()
+        self.assertTrue(self.window.bot_button.instate(['disabled']))
+        self.window.configure_bots()
+        self.assertIsNone(self.window.bot_dialog)
+
+    def test_failure_during_editing_keeps_draft_and_switches_save_message(self):
+        self.run_solo_session()
+        self.window.configure_bots()
+        dialog = self.window.bot_dialog
+        dialog.names_text.insert('1.0', 'Saved after failure')
+        with patch.object(gui.messagebox, 'showerror'):
+            self.window.emit('error', 'server disconnected')
+            self.window.emit('stopped', 'server disconnected')
+            self.window._drain()
+        self.assertTrue(dialog.winfo_exists())
+        dialog.save()
+        self.assertIn('下次单机启动', self.window.status.get())
+        self.assertEqual(json.loads(bot_config_path(self.directory).read_text())['custom_names'],
+                         ['Saved after failure'])
 
 
 if __name__ == '__main__':
