@@ -140,7 +140,10 @@ class CDNHandler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 print('Error trying to proxy: %s' % repr(exc))
 
-        SimpleHTTPRequestHandler.do_GET(self)
+        try:
+            SimpleHTTPRequestHandler.do_GET(self)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            pass  # The launcher's WebView2 hangs up while handing over to ZwiftApp.
 
 class DeviceType:
     Relay = 1

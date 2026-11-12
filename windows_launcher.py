@@ -46,6 +46,51 @@ def start_server(installation):
     })
 
 
+def _process_name(pid):
+    """Return the image name of a PID, or '' when it is not accessible."""
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    kernel.QueryFullProcessImageNameW.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                                  ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)]
+    kernel.QueryFullProcessImageNameW.restype = ctypes.c_int
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel.OpenProcess(0x1000, 0, int(pid))
+    if not handle:
+        return ''
+    try:
+        size = ctypes.c_ulong(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return ''
+        return os.path.basename(buffer.value)
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _port_owner(port, kind):
+    """Best-effort lookup of the local process holding a port: (pid, image name)."""
+    protocol = 'TCP' if kind == socket.SOCK_STREAM else 'UDP'
+    try:
+        completed = subprocess.run(['netstat', '-ano'], capture_output=True,
+                                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    except OSError:
+        return None
+    # netstat writes in the OEM code page; decoding as UTF-8 silently yields nothing.
+    output = completed.stdout.decode('oem', errors='replace') if completed.stdout else ''
+    for line in output.splitlines():
+        columns = line.split()
+        if len(columns) < 4 or columns[0].upper() != protocol:
+            continue
+        if not columns[1].endswith(':%d' % port) or not columns[-1].isdigit():
+            continue
+        pid = int(columns[-1])
+        if pid == os.getpid():
+            continue
+        return pid, _process_name(pid)
+    return None
+
+
 def preflight_ports(environ=None):
     """Check the same bind addresses and ports used by the original server."""
     environ = os.environ if environ is None else environ
@@ -62,7 +107,16 @@ def preflight_ports(environ=None):
             with socket.socket(family, kind) as probe:
                 probe.bind((address, port))
         except OSError as exc:
-            raise RuntimeError('服务端口 %s 无法使用：%s' % (port, exc)) from exc
+            owner = _port_owner(port, kind)
+            if owner is not None:
+                reason = '，该端口已被 %s（PID %d）占用，请先退出该程序' % (owner[1] or '其他进程', owner[0])
+            elif getattr(exc, 'winerror', None) == 10013:
+                # Windows reports wildcard-bind conflicts as "access denied", which
+                # reads like a permissions problem but usually is another program.
+                reason = '，可能被其他程序以通配地址占用'
+            else:
+                reason = ''
+            raise RuntimeError('服务端口 %s 无法使用%s：%s' % (port, reason, exc)) from exc
 
 
 def run_elevated_copy(installation, port, token, options=None):
