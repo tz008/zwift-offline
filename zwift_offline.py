@@ -99,6 +99,12 @@ def make_dir(name):
 if not make_dir(STORAGE_DIR):
     sys.exit(1)
 
+# Unlock all equipment by default, preserving an existing marker file.
+UNLOCK_ALL_EQUIPMENT_FILE = "%s/unlock_all_equipment.txt" % STORAGE_DIR
+if not os.path.isfile(UNLOCK_ALL_EQUIPMENT_FILE):
+    with open(UNLOCK_ALL_EQUIPMENT_FILE, 'a'):
+        pass
+
 SSL_DIR = "%s/ssl" % SCRIPT_DIR
 DATABASE_PATH = "%s/zwift-offline.db" % STORAGE_DIR
 DATABASE_CUR_VER = 3
@@ -2301,18 +2307,21 @@ def update_entitlements(profile):
     e.type = profile_pb2.ProfileEntitlement.EntitlementType.RIDE
     e.id = -1
     e.status = profile_pb2.ProfileEntitlement.ProfileEntitlementStatus.ACTIVE
-    if os.path.isfile('%s/unlock_entitlements.txt' % STORAGE_DIR) or os.path.isfile('%s/unlock_all_equipment.txt' % STORAGE_DIR):
+    if os.path.isfile('%s/unlock_entitlements.txt' % STORAGE_DIR) or os.path.isfile(UNLOCK_ALL_EQUIPMENT_FILE):
         with open('%s/data/entitlements.txt' % SCRIPT_DIR) as f:
             ent = json.load(f)
         entitlements = list(range(ent['first'], ent['last'] + 1))
-        if os.path.isfile('%s/unlock_all_equipment.txt' % STORAGE_DIR):
+        if os.path.isfile(UNLOCK_ALL_EQUIPMENT_FILE):
             entitlements.extend(list(range(1, ent['first'])))
+        existing = {e.id: e for e in profile.entitlements
+                    if e.type == profile_pb2.ProfileEntitlement.EntitlementType.USE}
         for entitlement in entitlements:
-            if not any(e.id == entitlement for e in profile.entitlements):
+            e = existing.get(entitlement)
+            if e is None:
                 e = profile.entitlements.add()
                 e.type = profile_pb2.ProfileEntitlement.EntitlementType.USE
                 e.id = entitlement
-                e.status = profile_pb2.ProfileEntitlement.ProfileEntitlementStatus.ACTIVE
+            e.status = profile_pb2.ProfileEntitlement.ProfileEntitlementStatus.ACTIVE
 
 def do_api_profiles(profile_id, is_json):
     profile = profile_pb2.PlayerProfile()
@@ -4501,6 +4510,31 @@ def api_power_curve_best(option):
     return power_curves.SerializeToString(), 200
 
 
+MAX_BIKE_LEVEL = 5
+
+
+def update_bike_progress(user_storage):
+    if not os.path.isfile(UNLOCK_ALL_EQUIPMENT_FILE):
+        return
+    # The full catalog includes special frames excluded from random bot equipment.
+    signatures = {a.bike_progress.signature for a in user_storage.attributes
+                  if a.HasField('bike_progress')}
+    for signature in GD['bike_upgrade_frames']:
+        signature = str(signature)
+        if signature not in signatures:
+            user_storage.attributes.add().bike_progress.signature = signature
+            signatures.add(signature)
+    now = int(time.time() * 1000)
+    for attribute in user_storage.attributes:
+        if attribute.HasField('bike_progress'):
+            progress = attribute.bike_progress
+            if progress.level < MAX_BIKE_LEVEL:
+                progress.level = MAX_BIKE_LEVEL
+                progress.percentage = 1.0
+                progress.last_upgrade = now
+                progress.time = now
+
+
 @app.route('/api/player-profile/user-game-storage/attributes', methods=['GET', 'POST'])
 @jwt_to_session_cookie
 @login_required
@@ -4521,9 +4555,12 @@ def api_player_profile_user_game_storage_attributes():
                           or getattr(a, f).signature == getattr(n, f).signature):
                             user_storage.attributes.remove(a)
             user_storage.attributes.add().CopyFrom(n)
+        update_bike_progress(user_storage)
         with open(user_storage_file, 'wb') as f:
             f.write(user_storage.SerializeToString())
         return '', 202
+    if '24' in request.args.getlist('n'):
+        update_bike_progress(user_storage)
     ret = user_storage_pb2.UserStorage()
     for n in request.args.getlist('n'):
         for a in user_storage.attributes:

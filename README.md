@@ -435,8 +435,10 @@ To enable support for IPv6 set the environment variable ``ZOFFLINE_SERVER_HOST``
 
 <details><summary>Entitlements</summary>
 
-* To unlock entitlements (special equipment), create a file ``unlock_entitlements.txt`` in the ``storage`` directory.
-* To unlock all equipment, create a file ``unlock_all_equipment.txt`` instead.
+* All equipment, including special equipment, is unlocked by default. The server automatically creates an empty ``unlock_all_equipment.txt`` file in the ``storage`` directory on startup if it is missing; existing files are preserved. Deleting the file causes it to be recreated on the next server start.
+* With equipment unlocks enabled, all bike frames also start at their maximum upgrade level (5/5), including special frames such as the Brompton. Bike progress stays at the maximum when the game saves it. Rider levels, XP, Drops and existing riding statistics are preserved.
+* ``unlock_entitlements.txt`` is still supported for special equipment, but is unnecessary while ``unlock_all_equipment.txt`` exists.
+* Windows users need an updated EXE; editing the source does not update an existing executable. The EXE uses the ``storage`` directory next to it. After enabling equipment unlocks, log in to the game again to refresh the player's equipment permissions.
 </details>
 
 <details><summary>CDN proxy</summary>

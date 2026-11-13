@@ -34,6 +34,7 @@ gd['runshirts'] = [int(x.get('signature')) for x in root.findall("./RUNSHIRTS/RU
 gd['runshorts'] = [int(x.get('signature')) for x in root.findall("./RUNSHORTS/RUNSHORT")]
 gd['runshoes'] = [int(x.get('signature')) for x in root.findall("./RUNSHOES/RUNSHOE")]
 bikeframes = {}
+gd['bike_upgrade_frames'] = [int(x.get('signature')) for x in root.findall("./BIKEFRAMES/BIKEFRAME")]
 for x in root.findall("./BIKEFRAMES/BIKEFRAME"):
     signature = int(x.get('signature'))
     if not signature in frame_exceptions:
