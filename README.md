@@ -6,6 +6,10 @@ zoffline also offers riding against ghosts (your previous rides). Enable this fe
 
 Additionally, zoffline's launcher allows selecting a specific map to ride on without mucking about with config files.
 
+## Android 本机单机 APK
+
+本仓库现提供 Android 本机单机工程，后台运行服务并通过本地 VPN 连接手机上的 Zwift，支持启动/停止、地图与幽灵骑手设置、日志和存档导出。构建命令为 `build-android.cmd --sdk "<Android SDK 路径>"`，产物为 `dist/zoffline-android-solo.apk`。Zwift 本体、游戏资源及适用的证书补丁需要另行准备；Android 17 完整骑行需真机验证。安装、构建及验证边界见 [android/README.md](android/README.md)。
+
 ## Windows single-file build
 
 On **x64 Windows with x64 CPython 3.11 or 3.12** installed, run this command from the repository:
@@ -176,7 +180,7 @@ to generate your own certificates and do the same.
 <details><summary>Android (non-rooted device)</summary>
 
 * Install required apps:
-  * Download and install ``ZofflineObb.apk`` from [here](https://github.com/Argon2000/ZofflineObbAndroid/releases/latest)
+  * Download and install ``ZofflineObb-v1.5.apk`` from [here](https://github.com/fatsbrown/ZofflineObbAndroid/releases/latest)
   * Download and install ``app-Github-release.apk`` from [here](https://github.com/x-falcon/Virtual-Hosts/releases/latest)
   * Create a `hosts.txt` file to use with the app (you could use a text editor app or create it online with an online tool such as [this](https://passwordsgenerator.net/text-editor/)). The file must look like this (replace ``<zoffline ip>`` with the IP address of the machine running zoffline):
     ```
@@ -191,7 +195,7 @@ to generate your own certificates and do the same.
 * Patch after every installation or update:
   * Install/update Zwift from Google play, but do not start it yet.
     * If you have already started it go to `Android Settings > Applications > Zwift` and clear data or uninstall and reinstall the app.
-  * __NOTE:__ ZofflineObb doesn't work on Android 15 and later versions. As a workaround, you can patch the OBB file on Windows. See [#505](https://github.com/zoffline/zwift-offline/issues/505) for details.
+  * __NOTE:__ The legacy Argon2000 patcher does not work on Android 15 and later. The linked v1.5 fork targets API 36 but Android 17 compatibility is unconfirmed. If patching on the phone fails, you can patch the OBB file on Windows using ADB. See [#505](https://github.com/zoffline/zwift-offline/issues/505) for details.
   * Open the `ZofflineObb` app and run it (allow access to storage)
   * Wait for process to finish (5-10min)
   * Run Zwift, hopefully it verifies download and runs

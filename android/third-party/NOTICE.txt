@@ -1,0 +1,22 @@
+zoffline Android solo
+
+The zoffline project is licensed under AGPL-3.0; see LICENSE in the runtime.
+The source for this APK is the accompanying zwift-offline repository, including
+the android directory. Distribute the corresponding source with modified builds.
+
+hev-socks5-tunnel 2.19.3: MIT
+https://github.com/heiher/hev-socks5-tunnel
+Its MIT license is reproduced in hev-socks5-tunnel-LICENSE.txt.
+
+Chaquopy 17.2.0: https://chaquo.com/chaquopy/license/
+Copyright (c) 2017-2025 Chaquo Ltd and contributors; MIT.
+See Chaquopy-LICENSE.txt.
+CPython 3.11: Python Software Foundation License
+https://docs.python.org/3.11/license.html
+See CPython-LICENSE.txt.
+Bundled OpenSSL: Apache License 2.0; see OpenSSL-LICENSE.txt.
+https://www.openssl.org/
+
+Python package license texts and metadata are included in Chaquopy's packaged
+requirements. See requirements-android.txt for the pinned application packages.
+This APK does not contain Zwift's proprietary client or game assets.

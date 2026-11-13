@@ -38,8 +38,9 @@ import udp_node_msgs_pb2
 import blob_gestures
 from peloton import (course_of, road_of, is_forward, clamp, lerp,
                      ROAD_POSITION_MIN, ROAD_POSITION_MAX, ROAD_POSITION_UNITS_PER_METER)
+from runtime_paths import resource_directory
 
-SCRIPT_DIR = sys._MEIPASS if getattr(sys, 'frozen', False) else os.path.dirname(os.path.realpath(__file__))
+SCRIPT_DIR = resource_directory()
 
 CONFIG_FILE_NAME = 'solo_blob.txt'
 ROAD_POSITION_CENTER = 10000000      # roadPosition of the middle of the road (as in peloton.py)

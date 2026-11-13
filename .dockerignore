@@ -1,2 +1,9 @@
 .git
 .gitignore
+.venv
+.venv-build
+build
+dist
+android/.gradle
+android/app/build
+android/local.properties

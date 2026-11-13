@@ -22,18 +22,16 @@ import solo_blob
 import udp_node_msgs_pb2
 import tcp_node_msgs_pb2
 import profile_pb2
+from runtime_paths import resource_directory, storage_directory
 
-if getattr(sys, 'frozen', False):
-    # If we're running as a pyinstaller bundle
-    SCRIPT_DIR = sys._MEIPASS
-    STORAGE_DIR = "%s/storage" % os.path.dirname(sys.executable)
-else:
-    SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-    STORAGE_DIR = "%s/storage" % SCRIPT_DIR
+SCRIPT_DIR = resource_directory()
+STORAGE_DIR = storage_directory()
+server_stop_event = globals().get('server_stop_event', threading.Event())
 
 CDN_DIR = "%s/cdn" % SCRIPT_DIR
-CDN_PROXY = os.path.isfile('%s/cdn-proxy.txt' % STORAGE_DIR)
-if not CDN_PROXY and not os.path.isfile('%s/disable_proxy.txt' % STORAGE_DIR):
+DISABLE_CDN_PROXY = os.environ.get('ZOFFLINE_DISABLE_CDN_PROXY', 'false').lower() == 'true'
+CDN_PROXY = not DISABLE_CDN_PROXY and os.path.isfile('%s/cdn-proxy.txt' % STORAGE_DIR)
+if not DISABLE_CDN_PROXY and not CDN_PROXY and not os.path.isfile('%s/disable_proxy.txt' % STORAGE_DIR):
     # If CDN proxy is disabled, try to resolve zwift.com using Google public DNS
     try:
         import dns.resolver
@@ -102,7 +100,8 @@ def sigint_handler(num, frame):
     udpserver.server_close()
     os._exit(0)
 
-signal.signal(signal.SIGINT, sigint_handler)
+if threading.current_thread() is threading.main_thread():
+    signal.signal(signal.SIGINT, sigint_handler)
 
 class CDNHandler(SimpleHTTPRequestHandler):
     def translate_path(self, path):
@@ -280,12 +279,12 @@ class TCPHandler(socketserver.BaseRequestHandler):
         details1 = msg.udp_config.relay_addresses.add()
         details1.lb_realm = udp_node_msgs_pb2.ZofflineConstants.RealmID
         details1.lb_course = 6 # watopia crowd
-        details1.ip = self.request.getpeername()[0] if self.request.getpeername()[0] in ['127.0.0.1', '::1'] else zo.server_ip
+        details1.ip = zo.relay_ip(self.request.getpeername()[0])
         details1.port = 3022
         details2 = msg.udp_config.relay_addresses.add()
         details2.lb_realm = 0 #generic load balancing realm
         details2.lb_course = 0 #generic load balancing course
-        details2.ip = self.request.getpeername()[0] if self.request.getpeername()[0] in ['127.0.0.1', '::1'] else zo.server_ip
+        details2.ip = zo.relay_ip(self.request.getpeername()[0])
         details2.port = 3022
         msg.udp_config.uc_f2 = 10
         msg.udp_config.uc_f3 = 30
@@ -307,7 +306,7 @@ class TCPHandler(socketserver.BaseRequestHandler):
 
         player_id = hello.player_id
         self.request.settimeout(1) #make recv non-blocking
-        while True:
+        while not server_stop_event.is_set():
             self.data = b''
             try:
                 self.data = self.request.recv(1024)
@@ -479,7 +478,7 @@ def load_pace_partners():
                     pp.position = 0
 
 def play_pace_partners():
-    while True:
+    while not server_stop_event.is_set():
         start = time.perf_counter()
         for pp_id in global_pace_partners.keys():
             pp = global_pace_partners[pp_id]
@@ -489,7 +488,7 @@ def play_pace_partners():
         if peloton_manager:
             peloton_manager.tick(pacer_update_freq)
         pause = pacer_update_freq - (time.perf_counter() - start)
-        if pause > 0: time.sleep(pause)
+        if pause > 0: server_stop_event.wait(pause)
 
 def get_names():
     bots_file = '%s/bot.txt' % STORAGE_DIR
@@ -550,7 +549,7 @@ def load_bots():
                         i += 1
 
 def play_bots():
-    while True:
+    while not server_stop_event.is_set():
         start = time.perf_counter()
         if zo.reload_pacer_bots:
             zo.reload_pacer_bots = False
@@ -563,10 +562,10 @@ def play_bots():
             else: bot.position = 0
             bot.route.states[bot.position].id = bot_id
         pause = bot_update_freq - (time.perf_counter() - start)
-        if pause > 0: time.sleep(pause)
+        if pause > 0: server_stop_event.wait(pause)
 
 def remove_inactive():
-    while True:
+    while not server_stop_event.is_set():
         for p_id in list(online.keys()):
             if zo.world_time() > online[p_id].worldTime + 30000:
                 zo.save_bookmark(online[p_id], 'Last ' + ('run' if online[p_id].sport == profile_pb2.Sport.RUNNING else 'ride'))
@@ -575,7 +574,7 @@ def remove_inactive():
                 if discord.announce:
                     discord.send_message("Leaving", p_id)
                 zo.logout_player(p_id)
-        time.sleep(5)
+        server_stop_event.wait(5)
 
 def is_state_new_for(peer_player_state, player_id):
     if not player_id in global_news.keys():
@@ -824,14 +823,14 @@ if os.path.isdir(PACE_PARTNERS_DIR):
     pp.start()
 
 def play_solo_blob():
-    while True:
+    while not server_stop_event.is_set():
         start = time.perf_counter()
         try:
             solo_blob_manager.tick(solo_blob.TICK_SECONDS)
         except Exception as exc:
             print('solo_blob tick: %s' % repr(exc))
         pause = solo_blob.TICK_SECONDS - (time.perf_counter() - start)
-        if pause > 0: time.sleep(pause)
+        if pause > 0: server_stop_event.wait(pause)
 
 solo_blob_manager = solo_blob.SoloBlobManager(STORAGE_DIR, get_names, zo.GD, zo.world_time,
     lambda: zo.global_peloton_bots, lambda d: setattr(zo, 'global_peloton_bots', d), zo.logger, send_update=zo.enqueue_player_update)
@@ -861,6 +860,8 @@ httpd = socketserver.ThreadingTCPServer((cdn_host, cdn_port), CDNHandler)
 zoffline_thread = threading.Thread(target=httpd.serve_forever)
 zoffline_thread.daemon = True
 zoffline_thread.start()
+if globals().get('on_server_created'):
+    on_server_created(httpd)
 
 tcp_host = os.environ.get('ZOFFLINE_TCP_HOST', SERVER_HOST)
 tcp_port = int(os.environ.get('ZOFFLINE_TCP_PORT', 3025))
@@ -868,6 +869,9 @@ tcpserver = socketserver.ThreadingTCPServer((tcp_host, tcp_port), TCPHandler)
 tcpserver_thread = threading.Thread(target=tcpserver.serve_forever)
 tcpserver_thread.daemon = True
 tcpserver_thread.start()
+if globals().get('on_server_created'):
+    tcpserver.daemon_threads = True
+    on_server_created(tcpserver)
 
 udp_host = os.environ.get('ZOFFLINE_UDP_HOST', SERVER_HOST)
 udp_port = int(os.environ.get('ZOFFLINE_UDP_PORT', 3024))
@@ -875,11 +879,14 @@ udpserver = socketserver.ThreadingUDPServer((udp_host, udp_port), UDPHandler)
 udpserver_thread = threading.Thread(target=udpserver.serve_forever)
 udpserver_thread.daemon = True
 udpserver_thread.start()
+if globals().get('on_server_created'):
+    udpserver.daemon_threads = True
+    on_server_created(udpserver)
 
 ri = threading.Thread(target=remove_inactive)
 ri.start()
 
-if os.path.exists(FAKE_DNS_FILE):
+if os.path.exists(FAKE_DNS_FILE) and os.environ.get('ZOFFLINE_DISABLE_FAKE_DNS', 'false').lower() != 'true':
     from fake_dns import fake_dns
     dns = threading.Thread(target=fake_dns, args=(zo.server_ip,))
     dns.start()

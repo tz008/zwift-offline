@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="preparing_service">正在准备本机服务和 VPN…</string>
+    <string name="game_login_received">✓ 已收到 Zwift 游戏登录</string>
+    <string name="back_to_zoffline">返回 zoffline</string>
+</resources>

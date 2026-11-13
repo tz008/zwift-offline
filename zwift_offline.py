@@ -27,8 +27,12 @@ from io import BytesIO
 from shutil import copyfile
 from flask import Flask, request, jsonify, redirect, render_template, url_for, flash, session, make_response, send_file, send_from_directory
 from flask_login import UserMixin, AnonymousUserMixin, LoginManager, login_user, current_user, login_required, logout_user
-from gevent.pywsgi import WSGIServer
-from gevent import ssl
+if os.environ.get('ZOFFLINE_WSGI_BACKEND') == 'embedded':
+    from embedded_wsgi import WSGIServer
+    import ssl
+else:
+    from gevent.pywsgi import WSGIServer
+    from gevent import ssl
 from google.protobuf.json_format import MessageToDict, Parse
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.utils import secure_filename
@@ -70,21 +74,18 @@ import workout_state
 import workouts_manifest
 import planned_workouts
 import free_strava
+from runtime_paths import resource_directory, storage_directory, logs_directory
 
 logging.basicConfig(level=os.environ.get("LOGLEVEL", "INFO"))
 logger = logging.getLogger('zoffline')
 logger.setLevel(logging.DEBUG)
 logging.getLogger('sqlalchemy.engine').setLevel(logging.WARN)
 
-if getattr(sys, 'frozen', False):
-    # If we're running as a pyinstaller bundle
-    SCRIPT_DIR = sys._MEIPASS
-    STORAGE_DIR = "%s/storage" % os.path.dirname(sys.executable)
-    LOGS_DIR = "%s/logs" % os.path.dirname(sys.executable)
-else:
-    SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-    STORAGE_DIR = "%s/storage" % SCRIPT_DIR
-    LOGS_DIR = "%s/logs" % SCRIPT_DIR
+SCRIPT_DIR = resource_directory()
+STORAGE_DIR = storage_directory()
+LOGS_DIR = logs_directory()
+server_stop_event = threading.Event()
+server_created_callback = None
 
 def make_dir(name):
     try:
@@ -113,6 +114,13 @@ if os.path.exists(SERVER_IP_FILE):
 else:
     server_ip = '127.0.0.1'
 server_ip = os.environ.get('ZOFFLINE_SERVER_IP', server_ip)
+
+
+def relay_ip(client_ip):
+    """Advertise the VPN destination when localhost is only an internal hop."""
+    return os.environ.get('ZOFFLINE_ADVERTISED_IP') or (
+        client_ip if client_ip in ['127.0.0.1', '::1'] else server_ip)
+
 SECRET_KEY_FILE = "%s/secret-key.txt" % STORAGE_DIR
 ENABLEGHOSTS_FILE = "%s/enable_ghosts.txt" % STORAGE_DIR
 GHOST_PROFILE = None
@@ -1886,7 +1894,7 @@ def api_users_login():
     response.info.apis.trainingpeaks_url = "https://api.trainingpeaks.com"
     response.info.time = int(time.time())
     udp_node = response.info.nodes.nodes.add()
-    udp_node.ip = request.remote_addr if request.remote_addr in ['127.0.0.1', '::1'] else server_ip  # TCP telemetry server
+    udp_node.ip = relay_ip(request.remote_addr)  # TCP telemetry server
     udp_node.port = 3023
     response.relay_session_id = player_id
     response.expiration = 70
@@ -3617,7 +3625,7 @@ def api_profiles_goals_id(player_id, goal_id):
 def api_tcp_config():
     infos = per_session_info_pb2.TcpConfig()
     info = infos.nodes.add()
-    info.ip = request.remote_addr if request.remote_addr in ['127.0.0.1', '::1'] else server_ip
+    info.ip = relay_ip(request.remote_addr)
     info.port = 3023
     return infos.SerializeToString(), 200
 
@@ -3946,13 +3954,13 @@ def group_bots(state, including_duplicates):
                 global_bots[bot].position = n
 
 def auto_group_bots():
-    while True:
+    while not server_stop_event.is_set():
         if auto_group['id'] in online:
             state = online[auto_group['id']]
             if road_id(state) != auto_group['road_id'] or is_forward(state) != auto_group['is_forward']:
                 auto_group.update({'road_id': road_id(state), 'is_forward': is_forward(state)})
                 group_bots(state, auto_group['all'])
-        time.sleep(3)
+        server_stop_event.wait(3)
 
 def is_admin(user):
     return True if not MULTIPLAYER or user.player_id == 1 or user.is_admin else False
@@ -4890,20 +4898,21 @@ def check_columns(table_class, table_name):
     return added
 
 def send_server_back_online_message():
-    time.sleep(30)
+    if server_stop_event.wait(30):
+        return
     message = "Server version %s is back online. Ride on!" % ZWIFT_VER_CUR
     send_message(message)
     discord.send_message(message)
 
 def remove_inactive():
-    while True:
+    while not server_stop_event.is_set():
         for p_id in list(player_partial_profiles.keys()):
             if time.monotonic() > player_partial_profiles[p_id].time + 3600:
                 player_partial_profiles.pop(p_id)
         for e_id in list(global_race_results.keys()):
             if time.monotonic() > global_race_results[e_id].time + 3600:
                 global_race_results.pop(e_id)
-        time.sleep(600)
+        server_stop_event.wait(600)
 
 
 with app.app_context():
@@ -5115,11 +5124,19 @@ def run_standalone(passed_online, passed_global_relay, passed_global_pace_partne
     use_cert = os.environ.get('ZOFFLINE_API_USE_CERT', 'true').lower() == 'true'
     if host != SERVER_HOST or port != 443 or not use_cert:
         logger.info("Listening on %s:%d using certificate: %s", host, port, use_cert)
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context = None
     if use_cert:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certfile='%s/cert-zwift-com.pem' % SSL_DIR, keyfile='%s/key-zwift-com.pem' % SSL_DIR)
     server = CleanWSGIServer((host, port), app, log=logger, ssl_context=context)
     server.start()
+    if globals().get('server_created_callback'):
+        server_created_callback(server)
+    if 'ZOFFLINE_MANAGEMENT_PORT' in os.environ:
+        management = WSGIServer(('127.0.0.1', int(os.environ['ZOFFLINE_MANAGEMENT_PORT'])), app, log=logger)
+        management.start()
+        if globals().get('server_created_callback'):
+            server_created_callback(management)
     logger.info("Server version %s is running." % ZWIFT_VER_CUR)
     if on_ready is not None:
         on_ready()
