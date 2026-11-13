@@ -59,3 +59,12 @@ coverage.xml
 Thumbs.db
 [Dd]esktop.ini
 github_account
+
+# Android generated files and local SDK/signing settings
+.gradle/
+local.properties
+*.jks
+*.keystore
+/android/app/src/main/python/
+/android/app/src/main/assets/runtime/
+/android/app/src/main/assets/third-party/
