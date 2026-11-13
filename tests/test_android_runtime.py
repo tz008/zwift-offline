@@ -45,7 +45,13 @@ worker = threading.Thread(target=android_runtime.run, args=(sys.argv[2], str(dir
 worker.start()
 while worker.is_alive():
     (directory/'status.json.tmp').write_text(android_runtime.status(), encoding='utf-8')
-    os.replace(str(directory/'status.json.tmp'), str(directory/'status.json'))
+    try:
+        os.replace(str(directory/'status.json.tmp'), str(directory/'status.json'))
+    except PermissionError as error:
+        # Windows briefly prevents replacement while the parent reads status.
+        # Retry on the next poll; startup still has its normal bounded deadline.
+        if os.name != 'nt' or error.winerror not in (5, 32):
+            raise
     if (directory/'stop').exists():
         android_runtime.stop()
     worker.join(0.05)
@@ -124,6 +130,56 @@ assert 'gevent' not in sys.modules, 'Embedded backend unexpectedly imports geven
         self.assertEqual(json.loads(body), {'service': 'zoffline', 'multiplayer': False})
         self.assertTrue((self.directory / 'storage' / 'zwift-offline.db').is_file())
         self.assertTrue((self.directory / 'logs' / 'android-server.log').is_file())
+
+    def test_default_equipment_unlocks_and_max_bikes_use_private_storage(self):
+        from protobuf import profile_pb2, user_storage_pb2
+
+        storage = self.directory / 'storage'
+        self.assertEqual((storage / 'unlock_all_equipment.txt').read_bytes(), b'')
+        headers = {'Accept': 'application/x-protobuf-lite',
+                   'Content-Type': 'application/x-protobuf-lite'}
+        status, _, body = self.request('/api/profiles/me', headers=headers)
+        self.assertEqual(status, 200)
+        profile = profile_pb2.PlayerProfile.FromString(body)
+        expected = json.loads((ROOT / 'data' / 'entitlements.txt').read_text(encoding='utf-8'))['last']
+        entitlements = {e.id: e for e in profile.entitlements
+                        if e.type == profile_pb2.ProfileEntitlement.USE}
+        self.assertEqual(set(entitlements), set(range(1, expected + 1)))
+        self.assertTrue(all(e.status == profile_pb2.ProfileEntitlement.ACTIVE
+                            for e in entitlements.values()))
+
+        path = '/api/player-profile/user-game-storage/attributes'
+        status, _, body = self.request(path + '?n=24', headers=headers)
+        self.assertEqual(status, 200)
+        garage = user_storage_pb2.UserStorage.FromString(body)
+        frames = json.loads((ROOT / 'data' / 'game_dictionary.txt').read_text(encoding='utf-8'))['bike_upgrade_frames']
+        self.assertEqual({a.bike_progress.signature for a in garage.attributes},
+                         {str(signature) for signature in frames})
+        self.assertTrue(all(a.bike_progress.level == 5 and a.bike_progress.percentage == 1
+                            for a in garage.attributes))
+        self.assertIn('3017804836', {a.bike_progress.signature for a in garage.attributes})
+
+        player = storage / str(profile.id)
+        player.mkdir(exist_ok=True)
+        saved_file = player / 'user_storage.bin'
+        self.assertFalse(saved_file.exists())
+        stale = user_storage_pb2.UserStorage()
+        bike = stale.attributes.add().bike_progress
+        bike.signature = '3017804836'
+        bike.level = 1
+        bike.total_distance = 123.5
+        status, _, _ = self.request(path, method='POST', body=stale.SerializeToString(),
+                                    headers=headers)
+        self.assertEqual(status, 202)
+        saved = user_storage_pb2.UserStorage.FromString(saved_file.read_bytes())
+        self.assertEqual(len(saved.attributes), len(frames))
+        self.assertTrue(all(a.bike_progress.level == 5 for a in saved.attributes))
+        brompton = next(a.bike_progress for a in saved.attributes
+                        if a.bike_progress.signature == '3017804836')
+        self.assertEqual(brompton.total_distance, 123.5)
+        status, _, body = self.request(path + '?n=24', headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(user_storage_pb2.UserStorage.FromString(body), saved)
 
     def test_management_and_cdn_serve_bundled_resources(self):
         status, _, body = self.request('/user/zoffline/', listener='management')

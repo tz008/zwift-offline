@@ -35,8 +35,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONObject;
 
 public final class MainActivity extends Activity {
+    static final String RESUME_CERTIFICATE = "resume-certificate-preparation";
     private static final int VPN_REQUEST = 20;
     private static final int BACKUP_REQUEST = 21;
+    private static final int CERTIFICATE_REQUEST = 23;
     private static final int INK = Color.rgb(25, 47, 44);
     private static final int TEAL = Color.rgb(0, 121, 107);
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -46,6 +48,7 @@ public final class MainActivity extends Activity {
     private boolean ready;
     private boolean statusKnown;
     private boolean startPending;
+    private boolean certificateStartPending;
     private static final AtomicBoolean exporting = new AtomicBoolean();
     private String lastState = "stopped";
     private TextView statusTitle;
@@ -57,6 +60,8 @@ public final class MainActivity extends Activity {
     private Button launch;
     private Button settings;
     private Button backup;
+    private Button certificates;
+    private TextView certificateSummary;
     private final Messenger replies = new Messenger(new Handler(Looper.getMainLooper(), message -> {
         if (message.what == OfflineVpnService.MSG_STATUS) {
             try { render(new JSONObject(message.getData().getString("status", "{}"))); }
@@ -138,11 +143,15 @@ public final class MainActivity extends Activity {
         LinearLayout preparation = card();
         addText(preparation, "第一次使用", 17, INK, 0, 8);
         addText(preparation, "1. 安装 Zwift，并准备好所需游戏资源。\n"
-                + "2. 完成适用于当前 Zwift 版本的证书补丁。\n"
+                + "2. 使用内置功能检查并修复游戏证书。\n"
                 + "3. 启动服务、允许 VPN，然后打开 Zwift。\n"
                 + "单机模式可用任意邮箱和密码登录；账号与存档仅在本机。",
                 14, Color.DKGRAY, 0, 12);
-        Button help = button("查看证书补丁说明", false, this::showHelp);
+        certificateSummary = label("启动前将检查当前版本的证书准备状态。", 13, TEAL);
+        preparation.addView(certificateSummary);
+        certificates = button("检查并修复 Zwift 证书", false, () -> openCertificatePreparation(false));
+        preparation.addView(certificates);
+        Button help = button("证书准备说明", false, this::showHelp);
         preparation.addView(help);
         add(content, preparation, 24, 0);
 
@@ -169,8 +178,25 @@ public final class MainActivity extends Activity {
     }
 
     private void startRide() {
-        if (exporting.get() || !statusKnown || active) return;
+        if (exporting.get() || CertificatePatchService.isBusy() || !statusKnown || active) return;
         if (!zwiftInstalled()) { toast("请先安装 Zwift 安卓客户端"); return; }
+        if (!CertificatePatchService.currentVersionPrepared(this)) {
+            openCertificatePreparation(true);
+            return;
+        }
+        continueStartRide();
+    }
+
+    private void openCertificatePreparation(boolean forStart) {
+        if (active || exporting.get() || !statusKnown) { toast("请先停止服务并完成存档导出"); return; }
+        if (!zwiftInstalled()) { toast("请先安装 Zwift 安卓客户端"); return; }
+        Intent intent = new Intent(this, CertificatePatchActivity.class).putExtra(CertificatePatchActivity.FOR_START, forStart);
+        if (forStart) startActivityForResult(intent, CERTIFICATE_REQUEST);
+        else startActivity(intent);
+    }
+
+    private void continueStartRide() {
+        if (active || exporting.get() || CertificatePatchService.isBusy()) return;
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 22);
@@ -192,6 +218,7 @@ public final class MainActivity extends Activity {
 
     private void startServer() {
         if (exporting.get()) { toast("正在导出存档，请完成后再启动"); return; }
+        if (CertificatePatchService.isBusy()) { toast("请等待证书检查完成，再启动服务"); return; }
         startPending = true;
         lastState = "starting";
         active = true;
@@ -269,15 +296,29 @@ public final class MainActivity extends Activity {
         String logs = status.optString("logs");
         if (!logs.isEmpty()) logText.setText(logs);
         updateButtons();
+        if (!active && getIntent().hasExtra(RESUME_CERTIFICATE)) {
+            boolean forStart = getIntent().getBooleanExtra(RESUME_CERTIFICATE, false);
+            getIntent().removeExtra(RESUME_CERTIFICATE);
+            main.post(() -> openCertificatePreparation(forStart));
+        }
+        if (certificateStartPending && !active) {
+            certificateStartPending = false;
+            main.post(this::continueStartRide);
+        }
     }
 
     private void updateButtons() {
         if (start == null) return;
-        start.setEnabled(statusKnown && !active && !exporting.get());
+        boolean patching = CertificatePatchService.isBusy();
+        start.setEnabled(statusKnown && !active && !exporting.get() && !patching);
         stop.setEnabled(active && !"stopping".equals(lastState));
         launch.setEnabled(ready);
         settings.setEnabled(ready);
-        backup.setEnabled(statusKnown && !active && !exporting.get());
+        backup.setEnabled(statusKnown && !active && !exporting.get() && !patching);
+        certificates.setEnabled(statusKnown && !active && !exporting.get());
+        certificateSummary.setText(patching ? "正在准备证书，请等待检查完成。"
+                : CertificatePatchService.currentVersionPrepared(this) ? "✓ 当前版本资源包的离线证书已检查"
+                : "启动前将检查当前版本的证书准备状态。");
     }
 
     private boolean zwiftInstalled() {
@@ -287,13 +328,13 @@ public final class MainActivity extends Activity {
 
     private void showHelp() {
         new AlertDialog.Builder(this).setTitle("Zwift 证书准备")
-                .setMessage("本 APK 提供本地服务和 VPN。Zwift 还需要接受本地服务器证书。\n\n"
-                        + "可以先尝试 ZofflineObb v1.5。它更新到 API 36，但 Android 17 上仍需实际验证。"
-                        + "手机端补丁失败时，可参考项目 issue #505，通过电脑和 ADB 处理 OBB。\n\n"
-                        + "补丁适用于对应的 Zwift 版本；游戏重新安装或更新后需要重新检查。"
-                        + "系统 VPN 授权或安装用户 CA 都不能单独证明补丁成功。")
-                .setPositiveButton("新版补丁工具", (dialog, which) -> openUrl(
-                        "https://github.com/fatsbrown/ZofflineObbAndroid/releases/latest"))
+                .setMessage("本 APK 已内置证书检查与 OBB 补丁，无需另装补丁应用。\n\n"
+                        + "先保存并退出 Zwift，再检查并修复证书。系统会请求访问游戏资源所需的文件和安装来源权限。"
+                        + "修补前保留原始资源包，校验成功后才应用。\n\n"
+                        + "已经解压到 Zwift 私有目录的旧证书无法直接修改。如果补丁前已打开游戏且仍出现证书错误，"
+                        + "请先备份，再通过系统设置清除 Zwift 应用数据以重新解压；仅清缓存无效。"
+                        + "本应用不会自动清除游戏数据。游戏更新后需要重新检查；实际连接仍以成功游戏登录为准。")
+                .setPositiveButton("检查并修复证书", (dialog, which) -> openCertificatePreparation(false))
                 .setNeutralButton("电脑补丁说明", (dialog, which) -> openUrl(
                         "https://github.com/zoffline/zwift-offline/issues/505"))
                 .setNegativeButton("返回", null).show();
@@ -314,11 +355,24 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == VPN_REQUEST) {
+        if (requestCode == CERTIFICATE_REQUEST && resultCode == RESULT_OK) {
+            if ((data == null || !data.getBooleanExtra(CertificatePatchActivity.MANUALLY_CONFIGURED, false))
+                    && !CertificatePatchService.currentVersionPrepared(this)) {
+                toast("Zwift 版本或资源已变化，请重新检查证书");
+                return;
+            }
+            certificateStartPending = true;
+            if (statusKnown && !active) {
+                certificateStartPending = false;
+                continueStartRide();
+            }
+        } else if (requestCode == VPN_REQUEST) {
             if (resultCode == RESULT_OK) startServer();
             else toast("未获得 VPN 授权，服务尚未启动");
         } else if (requestCode == BACKUP_REQUEST && resultCode == RESULT_OK && data != null && data.getData() != null) {
-            if (active || !exporting.compareAndSet(false, true)) { toast("请先停止服务再导出存档"); return; }
+            if (active || CertificatePatchService.isBusy() || !exporting.compareAndSet(false, true)) {
+                toast("请先停止服务并等待证书检查完成，再导出存档"); return;
+            }
             Uri destination = data.getData();
             updateButtons();
             new Thread(() -> {

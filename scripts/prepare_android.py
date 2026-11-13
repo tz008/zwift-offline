@@ -9,7 +9,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 PYTHON_FILES = (
-    'android_runtime.py', 'runtime_paths.py', 'embedded_wsgi.py',
+    'android_runtime.py', 'android_obb_patch.py', 'runtime_paths.py', 'embedded_wsgi.py',
     'standalone.py', 'zwift_offline.py', 'peloton.py', 'solo_blob.py',
     'blob_gestures.py', 'tokens.py', 'online_sync.py', 'intervals_workouts.py',
     'trainingpeaks_workouts.py', 'workout_state.py', 'workouts_manifest.py',

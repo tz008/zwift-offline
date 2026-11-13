@@ -52,6 +52,7 @@ public final class OfflineVpnService extends VpnService {
         return true;
     }));
     private final CountDownLatch backendFinished = new CountDownLatch(1);
+    private final CountDownLatch startupFinished = new CountDownLatch(1);
     private final Object resourcesLock = new Object();
     private volatile String state = "stopped";
     private volatile String detail = "尚未启动";
@@ -61,6 +62,7 @@ public final class OfflineVpnService extends VpnService {
     private volatile LocalSocksProxy proxy;
     private volatile ParcelFileDescriptor tunnel;
     private PowerManager.WakeLock wakeLock;
+    private RuntimeOperationLock operationLock;
 
     @Override public void onCreate() {
         super.onCreate();
@@ -117,6 +119,10 @@ public final class OfflineVpnService extends VpnService {
     private void startSession() {
         try {
             getPackageManager().getApplicationInfo(BuildConfig.ZWIFT_PACKAGE, 0);
+            synchronized (resourcesLock) {
+                if (stopping) return;
+                operationLock = RuntimeOperationLock.acquire(getFilesDir());
+            }
             File resources = RuntimeAssets.install(this);
             if (stopping) return;
             if (!Python.isStarted()) Python.start(new AndroidPlatform(this));
@@ -179,6 +185,7 @@ public final class OfflineVpnService extends VpnService {
             requestStop("启动失败：" + readable(error), true);
         } finally {
             if (runtime == null) backendFinished.countDown();
+            startupFinished.countDown();
         }
     }
 
@@ -223,6 +230,10 @@ public final class OfflineVpnService extends VpnService {
                 backendFinished.await(4, TimeUnit.SECONDS);
             } catch (Throwable failure) { log("停止过程：" + readable(failure)); }
             finally {
+                if (startupFinished.getCount() == 0 && backendFinished.getCount() == 0 && operationLock != null) {
+                    try { operationLock.close(); } catch (Exception failure) { log("释放运行锁：" + readable(failure)); }
+                    operationLock = null;
+                }
                 state = error ? "error" : "stopping";
                 detail = message;
                 main.post(() -> {
