@@ -2,14 +2,134 @@
 
 import ast
 import builtins
+from contextlib import closing
 import json
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
 import windows_bot_config as config
+
+
+class BotPlayerListTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='zoffline 玩家 # % ')
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.path = self.directory / 'storage' / 'zwift-offline.db'
+
+    def database(self, rows=()):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute('CREATE TABLE user (player_id, first_name, last_name, username, pass_hash)')
+            connection.executemany('INSERT INTO user VALUES (?, ?, ?, ?, ?)',
+                                   [tuple(row) + ('private password hash',) for row in rows])
+            connection.commit()
+
+    def test_missing_storage_or_database_returns_empty_without_creating_files(self):
+        self.assertEqual(config.list_bot_players(self.directory), [])
+        self.assertFalse(self.path.parent.exists())
+        self.path.parent.mkdir()
+        self.assertEqual(config.list_bot_players(self.directory), [])
+        self.assertEqual(list(self.path.parent.iterdir()), [])
+
+    def test_missing_user_table_and_empty_accounts_return_empty_without_changes(self):
+        self.path.parent.mkdir()
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute('CREATE TABLE version (version INTEGER)')
+            connection.commit()
+        original = self.path.read_bytes()
+        self.assertEqual(config.list_bot_players(self.directory), [])
+        self.assertEqual(self.path.read_bytes(), original)
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute('CREATE TABLE user (player_id, first_name, last_name, username)')
+            connection.commit()
+        original = self.path.read_bytes()
+        self.assertEqual(config.list_bot_players(self.directory), [])
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_players_are_sorted_cleaned_and_never_include_passwords(self):
+        self.database(((47, ' 张\t 三 ', ' 骑手\n ', ' first@example.com '),
+                       (2, '张 三', '骑手', 'second@example.com'),
+                       (10, '  ', None, ' username '), (11, '', '', ''),
+                       (0, 'Invalid', '', 'zero'), (-1, 'Invalid', '', 'negative'),
+                       (3.5, 'Invalid', '', 'fraction'), (None, 'Invalid', '', 'missing'),
+                       ('9223372036854775808', 'Invalid', '', 'overflow')))
+        original = self.path.read_bytes()
+        self.assertEqual(config.list_bot_players(self.directory), [
+            {'player_id': 2, 'name': '张 三 骑手', 'username': 'second@example.com'},
+            {'player_id': 10, 'name': 'username', 'username': 'username'},
+            {'player_id': 11, 'name': '未命名玩家', 'username': ''},
+            {'player_id': 47, 'name': '张 三 骑手', 'username': 'first@example.com'},
+        ])
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_query_is_read_only_skips_credentials_and_always_closes_connection(self):
+        self.database(((47, '张三', '', 'rider@example.com'),))
+        connect = sqlite3.connect
+        opened = []
+        reads = []
+
+        def readonly_connect(database_uri, **kwargs):
+            self.assertTrue(database_uri.endswith('?mode=ro'))
+            self.assertTrue(kwargs['uri'])
+            self.assertLessEqual(kwargs['timeout'], 0.2)
+            connection = connect(database_uri, **kwargs)
+            opened.append(connection)
+
+            def authorize(action, table, column, *unused):
+                if action == sqlite3.SQLITE_READ:
+                    reads.append((table, column))
+                    if column == 'pass_hash':
+                        return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            connection.set_authorizer(authorize)
+            return connection
+
+        with patch.object(config.sqlite3, 'connect', side_effect=readonly_connect):
+            self.assertEqual(config.list_bot_players(self.directory)[0]['player_id'], 47)
+        self.assertNotIn(('user', 'pass_hash'), reads)
+        self.assertTrue(opened)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            opened[0].execute('SELECT 1')
+
+    def test_corrupt_database_reports_error_without_changes(self):
+        self.path.parent.mkdir()
+        self.path.write_bytes(b'not a sqlite database')
+        original = self.path.read_bytes()
+        with self.assertRaisesRegex(config.BotConfigError, '玩家列表'):
+            config.list_bot_players(self.directory)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_locked_database_fails_promptly_without_changing_data(self):
+        self.database(((47, '张三', '', 'rider@example.com'),))
+        original = self.path.read_bytes()
+        with closing(sqlite3.connect(self.path)) as writer:
+            writer.execute('BEGIN EXCLUSIVE')
+            started = time.monotonic()
+            with self.assertRaisesRegex(config.BotConfigError, 'locked'):
+                config.list_bot_players(self.directory)
+            self.assertLess(time.monotonic() - started, 1.0)
+            writer.rollback()
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(config.list_bot_players(self.directory)[0]['player_id'], 47)
+
+    def test_incompatible_schema_is_reported_instead_of_silently_hiding_accounts(self):
+        self.path.parent.mkdir()
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute('CREATE TABLE user (player_id INTEGER)')
+            connection.commit()
+        original = self.path.read_bytes()
+        with self.assertRaisesRegex(config.BotConfigError, '玩家列表'):
+            config.list_bot_players(self.directory)
+        self.assertEqual(self.path.read_bytes(), original)
 
 
 class BotConfigTests(unittest.TestCase):
@@ -152,6 +272,49 @@ class BotConfigTests(unittest.TestCase):
         manager.load()
         self.assertEqual(list(manager.blobs), [47])
         self.assertEqual(len(manager.blobs[47].riders), 12)
+
+    def test_lan_player_id_accepts_positive_int64_integers_and_decimal_strings(self):
+        for value, expected in ((47, 47), (' 0047 ', 47), (1, 1),
+                                (9223372036854775807, 9223372036854775807),
+                                ('9223372036854775807', 9223372036854775807)):
+            with self.subTest(value=value):
+                self.assertEqual(config.validate_player_id(value), expected)
+
+    def test_invalid_lan_player_ids_identify_the_field_without_writing(self):
+        self.write({'enabled': True, 'riders': 8, 'player_id': 47})
+        original = self.path.read_bytes()
+        invalid = (None, True, False, 47.0, 0, -1, 9223372036854775808,
+                   '', ' ', '0', '-1', '+47', '47.0', '1e2', 'NaN',
+                   '9223372036854775808', '9' * 4500, [], {})
+        for value in invalid:
+            with self.subTest(value=repr(value)[:50]), self.assertRaises(config.BotConfigError) as error:
+                config.validate_player_id(value)
+            self.assertEqual(error.exception.field, 'player_id')
+            if value is not None:  # None retains the existing solo-save API.
+                with self.assertRaises(config.BotConfigError) as save_error:
+                    config.save_bot_config(self.directory, {'riders': 12}, player_id=value)
+                self.assertEqual(save_error.exception.field, 'player_id')
+            self.assertEqual(self.path.read_bytes(), original)
+
+    def test_explicit_lan_target_avoids_solo_profile_and_is_consumed_by_manager(self):
+        self.write({'enabled': True, 'riders': 8, 'player_id': 9, 'custom': {'备注': '保留'}})
+        with patch.object(config, 'solo_player_id', side_effect=AssertionError('LAN must use its chosen target')):
+            saved = config.save_bot_config(self.directory, {'riders': 12}, player_id='47')
+        self.assertEqual(saved['player_id'], 47)
+        self.assertEqual(saved['custom'], {'备注': '保留'})
+        self.assertEqual(config.load_bot_config(self.directory)['player_id'], 47)
+        manager = self.manager()
+        manager.load()
+        self.assertEqual(list(manager.blobs), [47])
+        self.assertEqual(len(manager.blobs[47].riders), 12)
+
+    def test_solo_save_still_selects_current_profile_after_explicit_lan_save(self):
+        profile = self.path.parent / '9' / 'profile.bin'
+        profile.parent.mkdir(parents=True)
+        profile.write_bytes(b'existing profile')
+        config.save_bot_config(self.directory, {'enabled': True}, player_id=47)
+        saved = config.save_bot_config(self.directory, {'riders': 12})
+        self.assertEqual(saved['player_id'], 9)
 
     def test_profile_selection_matches_server_directory_order_and_zero_fallback(self):
         for name in ('non-numeric', '47', '9', '0'):

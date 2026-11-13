@@ -57,6 +57,54 @@ class LiveConfigTests(unittest.TestCase):
         self.assertEqual(len(self.published()), count)
         return self.manager.blobs[1]
 
+    def test_lan_group_waits_for_remote_anchor_instead_of_using_solo_profile_or_other_rider(self):
+        profile = self.path.parent / '47' / 'profile.bin'
+        profile.parent.mkdir(parents=True)
+        profile.write_bytes(b'solo profile fixture')
+        save_bot_config(self.directory, {'enabled': True, 'riders': 3}, player_id=2)
+        self.step(3, player_id=1)
+        self.assertEqual(list(self.manager.blobs), [2])
+        self.assertFalse(self.published())
+        self.step(3, player_id=2)
+        blob = self.manager.blobs[2]
+        self.assertEqual(len(self.published()), 3)
+        self.assertTrue(blob.trail.ready())
+        self.assertTrue(all(entry['proto'].id == 2 for entry in blob.trail.entries))
+        self.assertIn(8000001, self.registry)
+
+    def test_lan_live_anchor_switch_uses_target_trail_and_removes_old_roster(self):
+        self.step(3, player_id=2)
+        save_bot_config(self.directory, {'enabled': True, 'riders': 3}, player_id=2)
+        self.step(player_id=1)
+        old = self.manager.blobs[2]
+        old_ids = set(self.published())
+        target_trail = self.manager._recent_trails[1]['trail']
+        save_bot_config(self.directory, {'riders': 5, 'custom_names': ['跟随新目标']}, player_id=1)
+        self.step(player_id=2)
+        self.assertEqual(list(self.manager.blobs), [1])
+        self.assertEqual(len(self.published()), 5)
+        self.assertTrue(old_ids.isdisjoint(self.published()))
+        updated = self.manager.blobs[1]
+        self.assertIs(updated.trail, target_trail)
+        self.assertIsNot(updated.trail, old.trail)
+        self.assertTrue(all(entry['proto'].id == 1 for entry in updated.trail.entries))
+        self.assertEqual(updated.riders[0].profile.last_name, '跟随新目标')
+        self.assertIn(8000001, self.registry)
+
+    def test_lan_remote_anchor_can_be_disabled_and_reenabled_without_local_riding(self):
+        save_bot_config(self.directory, {'enabled': True, 'riders': 4}, player_id=2)
+        self.step(3, player_id=2)
+        trail = self.manager.blobs[2].trail
+        self.assertEqual(len(self.published()), 4)
+        save_bot_config(self.directory, {'enabled': False}, player_id=2)
+        self.step(player_id=2)
+        self.assertFalse(self.manager.blobs)
+        self.assertEqual(set(self.registry), {8000001})
+        save_bot_config(self.directory, {'enabled': True}, player_id=2)
+        self.step(player_id=2)
+        self.assertIs(self.manager.blobs[2].trail, trail)
+        self.assertEqual(len(self.published()), 4)
+
     def test_riding_enable_disable_and_reenable_use_recent_trail_without_warmup(self):
         blob = self.enable()
         trail = blob.trail

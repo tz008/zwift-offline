@@ -10,20 +10,21 @@ from zwift_installation import find_zwift_installation
 from windows_launcher import runtime_directory
 from windows_network import list_lan_addresses, probe_server, validate_server_ip
 from windows_session import DesktopSession, load_settings, validate_options
-from windows_bot_config import (BOT_DEFAULTS, BotConfigError, load_bot_config,
-                                save_bot_config, solo_player_id)
+from windows_bot_config import (BOT_DEFAULTS, BotConfigError, list_bot_players, load_bot_config,
+                                save_bot_config, solo_player_id, validate_player_id)
 
 
 class BotConfigDialog(tk.Toplevel):
     """A modal editor; Save applies the draft to the running local server."""
 
-    def __init__(self, parent, directory, config, on_saved, live=False):
+    def __init__(self, parent, directory, config, on_saved, live=False, mode='single'):
         super().__init__(parent)
         self.directory = directory
+        self.mode = mode
         self.initial_config = dict(config)
         self.defaults_restored = False
         self.on_saved = on_saved
-        self.title('机器人配置 · zoffline')
+        self.title('局域网机器人配置 · zoffline' if mode == 'host' else '机器人配置 · zoffline')
         self.transient(parent)
         self.resizable(False, False)
         self.protocol('WM_DELETE_WINDOW', self.cancel)
@@ -34,11 +35,21 @@ class BotConfigDialog(tk.Toplevel):
                 continue
             variable = tk.BooleanVar if isinstance(default, bool) else tk.StringVar
             self.variables[key] = variable(self, value=config[key])
+        self.player_id = (tk.StringVar(self, value=str(config.get('player_id', 1)))
+                          if mode == 'host' else None)
+        self.player_field = None
+        self.player_choices = {}
+        self.players = {}
+        self.player_hint = tk.StringVar(self)
+        self.player_list_error = tk.StringVar(self)
         self.error = tk.StringVar(self)
         self.save_hint = tk.StringVar(self)
         self.enabled_hint = tk.StringVar(self)
         self.fields = {}
         self._build()
+        if self.mode == 'host':
+            self.player_id.trace_add('write', lambda *_: self._update_player_hint())
+            self.refresh_players()
         self.set_live(live)
         self._update_fields()
         self.update_idletasks()
@@ -51,9 +62,12 @@ class BotConfigDialog(tk.Toplevel):
         outer = ttk.Frame(self, padding=20)
         outer.pack(fill='both', expand=True)
         outer.columnconfigure(0, weight=1)
-        ttk.Label(outer, text='单机跟骑机器人', font=('Microsoft YaHei UI', 16, 'bold')).grid(
+        title = '局域网跟骑机器人' if self.mode == 'host' else '单机跟骑机器人'
+        description = ('机器人跟随指定玩家的速度和路线；该玩家开始骑行后出现，附近其他玩家共享可见。'
+                       if self.mode == 'host' else '机器人围绕你跟骑，并随你的速度和路线移动。')
+        ttk.Label(outer, text=title, font=('Microsoft YaHei UI', 16, 'bold')).grid(
             row=0, sticky='w')
-        ttk.Label(outer, text='机器人围绕你跟骑，并随你的速度和路线移动。',
+        ttk.Label(outer, text=description, wraplength=470,
                   style='Subtitle.TLabel').grid(row=1, sticky='w', pady=(4, 16))
         self.tabs = ttk.Notebook(outer)
         self.tabs.grid(row=2, sticky='nsew')
@@ -77,26 +91,40 @@ class BotConfigDialog(tk.Toplevel):
         self.names_text.tag_configure('invalid-name', background='#fde8e8')
         ttk.Label(self.names_tab, text='减少人数会保留多出的名称；换阵容也会保留名称顺序。',
                   wraplength=440, style='Subtitle.TLabel').pack(anchor='w', pady=(10, 0))
+        basic_row = 0
+        if self.mode == 'host':
+            ttk.Label(basic, text='跟随玩家').grid(row=0, column=0, sticky='w')
+            self.player_field = ttk.Combobox(basic, textvariable=self.player_id, width=26,
+                                              postcommand=self.refresh_players)
+            self.player_field.grid(row=0, column=1, sticky='w', padx=(18, 10))
+            self.player_refresh = ttk.Button(basic, text='刷新', command=self.refresh_players)
+            self.player_refresh.grid(row=0, column=2, sticky='w')
+            ttk.Label(basic, textvariable=self.player_hint,
+                      wraplength=440, style='Subtitle.TLabel').grid(
+                          row=1, column=0, columnspan=3, sticky='w', pady=(6, 0))
+            ttk.Label(basic, textvariable=self.player_list_error, foreground='#b42318',
+                      wraplength=440).grid(row=2, column=0, columnspan=3, sticky='w', pady=(4, 12))
+            basic_row = 3
         ttk.Checkbutton(basic, text='启用跟骑机器人', variable=self.variables['enabled']).grid(
-            row=0, column=0, columnspan=3, sticky='w', pady=(0, 16))
-        ttk.Label(basic, text='机器人人数').grid(row=1, column=0, sticky='w')
+            row=basic_row, column=0, columnspan=3, sticky='w', pady=(0, 16))
+        ttk.Label(basic, text='机器人人数').grid(row=basic_row + 1, column=0, sticky='w')
         self.fields['riders'] = ttk.Spinbox(basic, from_=1, to=30, width=10,
                                           textvariable=self.variables['riders'])
-        self.fields['riders'].grid(row=1, column=1, sticky='w', padx=(18, 10))
-        ttk.Label(basic, text='人（1–30）', style='Subtitle.TLabel').grid(row=1, column=2, sticky='w')
-        ttk.Label(basic, text='跟骑队形').grid(row=2, column=0, sticky='w', pady=(18, 6))
+        self.fields['riders'].grid(row=basic_row + 1, column=1, sticky='w', padx=(18, 10))
+        ttk.Label(basic, text='人（1–30）', style='Subtitle.TLabel').grid(row=basic_row + 1, column=2, sticky='w')
+        ttk.Label(basic, text='跟骑队形').grid(row=basic_row + 2, column=0, sticky='w', pady=(18, 6))
         formation = ttk.Frame(basic)
-        formation.grid(row=3, column=0, columnspan=3, sticky='w', pady=(0, 16))
+        formation.grid(row=basic_row + 3, column=0, columnspan=3, sticky='w', pady=(0, 16))
         for index, (value, label) in enumerate(((True, '自然散开'), (False, '整齐列队'))):
             ttk.Radiobutton(formation, text=label, variable=self.variables['scatter'], value=value,
                             command=self._update_fields).grid(row=0, column=index, padx=(0, 28))
         ttk.Checkbutton(basic, text='自动轮流领骑', variable=self.variables['rotate'],
-                        command=self._update_fields).grid(row=4, column=0, columnspan=3, sticky='w', pady=5)
+                        command=self._update_fields).grid(row=basic_row + 4, column=0, columnspan=3, sticky='w', pady=5)
         ttk.Checkbutton(basic, text='机器人主动打手势', variable=self.variables['bot_gestures']).grid(
-            row=5, column=0, columnspan=3, sticky='w', pady=5)
+            row=basic_row + 5, column=0, columnspan=3, sticky='w', pady=5)
         ttk.Label(basic, textvariable=self.enabled_hint,
                   wraplength=440, style='Subtitle.TLabel').grid(
-                      row=6, column=0, columnspan=3, sticky='w', pady=(16, 4))
+                      row=basic_row + 6, column=0, columnspan=3, sticky='w', pady=(16, 4))
         for row, (key, label, unit, hint) in enumerate((
                 ('row_gap', '前后排间距', '米', '整齐列队 · 0.5–10'),
                 ('lateral_spacing', '横向间距', '米', '两种队形 · 0.5–3'),
@@ -123,10 +151,59 @@ class BotConfigDialog(tk.Toplevel):
         ttk.Button(actions, text='取消', command=self.cancel).pack(side='right')
 
     def set_live(self, live):
+        if self.mode == 'host':
+            self.save_hint.set('服务器运行中：保存后约 1 秒更新车队；目标玩家骑行后出现。未启用的参数保留上次保存值。'
+                               if live else '配置会保留到下次服务器启动；未启用的参数保留上次保存值。')
+            self.enabled_hint.set('取消勾选并保存后，服务器会移除这支车队，其他参数保留。'
+                                  if live else '取消勾选并保存后，下次服务器启动将关闭机器人，其他参数保留。')
+            return
         self.save_hint.set('本机服务运行中：保存后约 1 秒更新当前骑行。未启用的参数保留上次保存值。'
                            if live else '配置会保留到下次单机启动；未启用的参数保留上次保存值。')
         self.enabled_hint.set('取消勾选并保存后，当前骑行的机器人会移除，其他参数保留。'
                               if live else '取消勾选并保存后，下次启动将关闭机器人，其他参数保留。')
+
+    def _selected_player_id(self):
+        value = self.player_id.get()
+        return validate_player_id(self.player_choices.get(value, value))
+
+    def _update_player_hint(self):
+        try:
+            player = self.players.get(self._selected_player_id())
+        except BotConfigError:
+            player = None
+        if player:
+            self.player_hint.set('登录账号：%s。可按姓名选择，也可手动填写玩家 ID。'
+                                 % (player['username'] or '未填写'))
+        elif not self.players:
+            self.player_hint.set('暂未发现玩家账号。请先让玩家在这台服务器注册或登录，再刷新；也可手动填写 ID。')
+        else:
+            self.player_hint.set('请选择姓名，或手动填写玩家 ID；列表中没有目标时可让玩家先注册再刷新。')
+
+    def refresh_players(self):
+        """Keep the selected numeric target, including drafts absent from the list."""
+        draft = self.player_id.get()
+        was_choice = draft in self.player_choices
+        try:
+            player_id = self._selected_player_id()
+        except BotConfigError:
+            player_id = None
+        try:
+            players = list_bot_players(self.directory)
+        except BotConfigError as exc:
+            self.player_list_error.set('%s。可继续选择已有玩家或手动填写 ID 后保存。' % exc)
+            self._update_player_hint()
+            return
+        self.players = {player['player_id']: player for player in players}
+        self.player_choices = {'%s · ID %d' % (player['name'], player['player_id']): player['player_id']
+                               for player in players}
+        self.player_field.configure(values=list(self.player_choices))
+        label = next((label for label, value in self.player_choices.items() if value == player_id), None)
+        if label is not None:
+            self.player_id.set(label)
+        elif was_choice:
+            self.player_id.set(str(player_id))
+        self.player_list_error.set('')
+        self._update_player_hint()
 
     def _update_fields(self):
         scatter = self.variables['scatter'].get()
@@ -158,10 +235,14 @@ class BotConfigDialog(tk.Toplevel):
                 if field.instate(['disabled']):
                     values[key] = (BOT_DEFAULTS if self.defaults_restored else self.initial_config)[key]
                     active.discard(key)
-            config = save_bot_config(self.directory, values, edited_fields=active)
+            player_id = self._selected_player_id() if self.mode == 'host' else None
+            config = save_bot_config(self.directory, values, edited_fields=active, player_id=player_id)
         except BotConfigError as exc:
             self.error.set(str(exc))
-            if exc.field == 'custom_names':
+            if exc.field == 'player_id' and self.player_field is not None:
+                self.tabs.select(self.basic_tab)
+                self.player_field.focus_set()
+            elif exc.field == 'custom_names':
                 self.tabs.select(self.names_tab)
                 self.names_text.focus_set()
                 line = exc.line or 1
@@ -242,11 +323,11 @@ class LauncherWindow:
         self.details.columnconfigure(0, weight=1)
         self.single_frame = ttk.Frame(self.details)
         ttk.Label(self.single_frame, text='在这台电脑启动服务并打开 Zwift。').pack(anchor='w')
-        bots = ttk.Frame(self.single_frame)
-        bots.pack(fill='x', pady=(10, 0))
-        self.bot_button = ttk.Button(bots, text='机器人配置…', command=self.configure_bots)
+        self.bot_frame = ttk.Frame(self.details)
+        self.bot_button = ttk.Button(self.bot_frame, text='机器人配置…', command=self.configure_bots)
         self.bot_button.pack(side='left')
-        ttk.Label(bots, textvariable=self.bot_summary, style='Subtitle.TLabel').pack(side='left', padx=(12, 0))
+        ttk.Label(self.bot_frame, textvariable=self.bot_summary, style='Subtitle.TLabel',
+                  wraplength=470).pack(side='left', padx=(12, 0))
         self.editable.append(self.bot_button)
         self.host_frame = ttk.Frame(self.details)
         self.host_frame.columnconfigure(1, weight=1)
@@ -302,8 +383,12 @@ class LauncherWindow:
                  '启动服务器并骑行' if self.mode.get() == 'host' else
                  '连接并启动 Zwift' if self.mode.get() == 'join' else '启动 Zwift')
         self.start_button.configure(text=label)
+        if self.mode.get() in ('single', 'host'):
+            self.bot_frame.grid(row=1, column=0, sticky='ew', pady=(10, 0))
+        else:
+            self.bot_frame.grid_remove()
         self._update_bot_controls()
-        if self.mode.get() == 'single':
+        if self.mode.get() in ('single', 'host'):
             self._refresh_bot_summary()
 
     def _refresh_bot_summary(self):
@@ -313,7 +398,14 @@ class LauncherWindow:
             self.bot_summary.set('配置无法读取，请点击“机器人配置”检查。')
 
     def _set_bot_summary(self, config):
-        if config['enabled']:
+        host = self.mode.get() == 'host'
+        if host:
+            try:
+                player_id = validate_player_id(config.get('player_id', 1))
+            except BotConfigError:
+                self.bot_summary.set('机器人：请打开配置并修正跟随玩家 ID。')
+                return
+        elif config['enabled']:
             try:
                 matches_player = int(config.get('player_id') or 1) == solo_player_id(self.directory)
             except (TypeError, ValueError, OverflowError):
@@ -321,9 +413,18 @@ class LauncherWindow:
             if not matches_player:
                 self.bot_summary.set('机器人：请打开配置并保存，以应用到当前单机玩家。')
                 return
-        self.bot_summary.set('机器人：%s' % (
+        summary = '机器人：%s' % (
             '%d 人 · %s' % (max(1, min(30, config['riders'])), '自然散开' if config['scatter'] else '整齐列队')
-            if config['enabled'] else '未启用'))
+            if config['enabled'] else '未启用')
+        if host:
+            try:
+                player = next((player for player in list_bot_players(self.directory)
+                               if player['player_id'] == player_id), None)
+            except BotConfigError:
+                player = None
+            summary += (' · 跟随 %s（ID %d）' % (player['name'], player_id) if player
+                        else ' · 跟随玩家 ID %d' % player_id)
+        self.bot_summary.set(summary)
 
     def configure_bots(self):
         if not self._can_configure_bots():
@@ -336,16 +437,22 @@ class LauncherWindow:
         except BotConfigError as exc:
             messagebox.showerror('机器人配置', str(exc), parent=self.root)
             return
-        self.bot_dialog = BotConfigDialog(self.root, self.directory, config, self._bots_saved, live=self.running)
+        self.bot_dialog = BotConfigDialog(self.root, self.directory, config, self._bots_saved,
+                                          live=self.running, mode=self.mode.get())
 
     def _bots_saved(self, config):
         self._set_bot_summary(config)
+        if self.mode.get() == 'host':
+            self.status.set('机器人配置已保存，服务器约 1 秒内更新；目标玩家骑行后出现。'
+                            if self.running and not self.stopping and not self.closing
+                            else '机器人配置已保存，下次服务器启动时生效。')
+            return
         self.status.set('机器人配置已保存，当前骑行约 1 秒内更新。'
                         if self.running and not self.stopping and not self.closing
                         else '机器人配置已保存，下次单机启动时生效。')
 
     def _can_configure_bots(self):
-        return (self.mode.get() == 'single' and not self.checking and not self.closing
+        return (self.mode.get() in ('single', 'host') and not self.checking and not self.closing
                 and not self.stopping and (not self.busy or self.running))
 
     def _update_bot_controls(self):
@@ -408,7 +515,7 @@ class LauncherWindow:
         self.check_button.configure(state='disabled' if value or self.checking else 'normal')
         self.stop_button.configure(state='normal' if value else 'disabled')
         self._update_bot_controls()
-        if not value and self.mode.get() == 'single':
+        if not value and self.mode.get() in ('single', 'host'):
             self._refresh_bot_summary()
 
     def start(self):
@@ -419,8 +526,10 @@ class LauncherWindow:
             return
         mode = self.mode.get()
         try:
-            if mode == 'single':
-                load_bot_config(self.directory)
+            if mode in ('single', 'host'):
+                config = load_bot_config(self.directory)
+                if mode == 'host' and config['enabled']:
+                    validate_player_id(config.get('player_id', 1))
             options = validate_options({'mode': mode, 'ride': self.ride.get(),
                                         'server_ip': self.join_ip.get() if mode == 'join' else self.host_ip.get()})
             settings = {'mode': mode, 'host_ip': self.host_ip.get(),
@@ -488,6 +597,8 @@ class LauncherWindow:
                     continue
                 self.running = True
                 self._update_bot_controls()
+                if self.mode.get() in ('single', 'host'):
+                    self._refresh_bot_summary()
                 text = ('局域网服务器运行中：%s' % value['server_ip'] if value['mode'] == 'host' else
                         '已连接服务器：%s' % value['server_ip'] if value['mode'] == 'join' else '本机服务运行中。')
                 self.status.set(text)

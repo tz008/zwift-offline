@@ -4,8 +4,10 @@ import json
 import math
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import unicodedata
+from contextlib import closing
 
 
 # Keep these public UI defaults aligned with solo_blob.DEFAULT_CONFIG. The
@@ -62,6 +64,45 @@ def solo_player_id(directory):
             except ValueError:
                 continue
     return 1
+
+
+def validate_player_id(value):
+    """Accept the positive int64 player IDs used by the multiplayer server."""
+    if isinstance(value, str) and value.strip().isdecimal():
+        try:
+            value = int(value.strip())
+        except ValueError:
+            value = None
+    if type(value) is not int or not 1 <= value <= 9223372036854775807:
+        raise BotConfigError('跟随玩家 ID 必须是正整数，且不超过 9223372036854775807。', 'player_id')
+    return value
+
+
+def list_bot_players(directory):
+    """Read account names from an existing database with a read-only connection."""
+    path = Path(directory) / 'storage' / 'zwift-offline.db'
+    try:
+        if not path.exists():
+            return []
+        with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.15)) as connection:
+            if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user'").fetchone():
+                return []
+            rows = connection.execute('SELECT player_id, first_name, last_name, username FROM user ORDER BY player_id')
+            players = []
+            for player_id, first_name, last_name, username in rows:
+                try:
+                    player_id = validate_player_id(player_id)
+                except BotConfigError:
+                    continue
+                first_name, last_name, username = (
+                    ' '.join(value.split()) if isinstance(value, str) else ''
+                    for value in (first_name, last_name, username))
+                name = ' '.join(part for part in (first_name, last_name) if part)
+                players.append({'player_id': player_id, 'name': name or username or '未命名玩家',
+                                'username': username})
+        return sorted(players, key=lambda player: player['player_id'])
+    except (OSError, sqlite3.Error) as exc:
+        raise BotConfigError('无法读取服务器玩家列表 %s：%s' % (path, exc)) from exc
 
 
 def _reject_constant(value):
@@ -150,8 +191,8 @@ def load_bot_config(directory):
     return dict(raw, **validate_bot_config(raw, strict=False))
 
 
-def save_bot_config(directory, config, *, edited_fields=None):
-    """Merge against the current file so unrelated hand-edited keys survive."""
+def save_bot_config(directory, config, *, edited_fields=None, player_id=None):
+    """Merge editable settings, with an explicit LAN anchor or the solo player."""
     path = bot_config_path(directory)
     raw = _read_config(path)
     editable = {key: config[key] for key in BOT_DEFAULTS if key in config}
@@ -159,7 +200,8 @@ def save_bot_config(directory, config, *, edited_fields=None):
     validate_bot_config(raw, strict=False)
     fields = editable.keys() if edited_fields is None else edited_fields
     values = validate_bot_config(dict(raw, **editable), fields=fields)
-    result = dict(raw, **values, player_id=solo_player_id(directory))
+    anchor = solo_player_id(directory) if player_id is None else validate_player_id(player_id)
+    result = dict(raw, **values, player_id=anchor)
     temporary = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
